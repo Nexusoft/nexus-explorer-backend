@@ -5,7 +5,7 @@ from flask_cors import CORS, cross_origin
 import requests_cache
 
 from dotenv import load_dotenv
-load_dotenv("local.env")
+load_dotenv(".env")
 
 app = Flask('__main__')
 cors = CORS(app)
