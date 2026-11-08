@@ -47,6 +47,7 @@ It follows the tip every 10 seconds and backfills older blocks in the background
 - `GET /explorer/address/<address>/transactions?limit=25&before=<height>`
 - `GET /explorer/owner/<genesis>` - accounts, trust accounts, tokens, assets, names and namespaces owned by one signature chain (hourly owner index, up to 1000 rows, `total` = all)
 - `GET /explorer/owner/<genesis>/transactions?limit=25&transfers=1&before=<height>` - value moves to or from any account, trust account or token of that signature chain, newest first; `addresses` = the chain's registers counted, `next` = cursor
+- `GET /explorer/search?q=<text>` - tokens, global names, namespaces and assets whose name starts with the text (any case), exact matches first, up to 50
 - `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens|ledgermetrics|markets|assets|tokenholders>`
 
 Without the index these routes answer 503 and the frontend falls back to the node API.

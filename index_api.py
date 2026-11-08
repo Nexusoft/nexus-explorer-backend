@@ -180,6 +180,38 @@ def owner_transactions(genesis):
     return jsonify({"result": rows, "addresses": addrs, "next": nxt})
 
 
+SEARCH_LIMIT = 50
+SEARCH_MAX_LEN = 64
+#searchable by name: tokens (ticker), global names, namespaces, assets; local names are
+#only unique inside one signature chain, and most are "default" or "trust"
+
+
+@bp.route("/search")
+def search_names():
+    """Registers whose name starts with q (any case), exact matches first"""
+    con = db()
+    if not con:
+        return unavailable()
+    q = (request.args.get("q") or "").strip()[:SEARCH_MAX_LEN]
+    if len(q) < 2:
+        return jsonify({"result": []})
+    like = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    try:
+        with con:
+            rows = con.execute(
+                "SELECT address, owner, kind, name, token, ticker, info, modified FROM registers "
+                "WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE "
+                "AND (kind IN ('token', 'namespace', 'asset') "
+                "OR (kind = 'name' AND json_extract(info, '$.global') = 1)) "
+                "ORDER BY lower(name) = lower(?) DESC, "
+                "CASE kind WHEN 'token' THEN 0 WHEN 'name' THEN 1 WHEN 'namespace' THEN 2 ELSE 3 END, "
+                "length(name), name LIMIT ?", (like, q, SEARCH_LIMIT)).fetchall()
+    except sqlite3.OperationalError:
+        return unavailable()
+    return jsonify({"result": [{**dict(r), "info": json.loads(r["info"]) if r["info"] else None}
+                               for r in rows]})
+
+
 @bp.route("/cache/<key>")
 def cached(key):
     con = db()
