@@ -24,3 +24,22 @@ sudo apt install gunicorn3
 SERVER_URL="http://api.nexus-interactions.io:8080" gunicorn3 -w 1 -b 0.0.0.0:5001 app:app
 ```
 To increase number of worker threads for gunicorn3 use -w option.
+## Optional indexer
+
+`indexer.py` keeps a SQLite index next to the node (`INDEX_DB`, default `explorer_index.sqlite`):
+blocks, transactions and value moves for the whole chain, plus cached copies of the slow
+register lists (rich list, trust list, global names, namespaces, tokens), refreshed every 10 minutes.
+
+```
+python indexer.py
+```
+
+It follows the tip every 10 seconds and backfills older blocks in the background
+(a full mainnet backfill takes about an hour). `app.py` serves the index read-only:
+
+- `GET /explorer/status` - indexed height range and cache times
+- `GET /explorer/transactions?limit=25&transfers=1&before=<height>` - newest first, `next` = cursor for the following page
+- `GET /explorer/address/<address>/transactions?limit=25&before=<height>`
+- `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens>`
+
+Without the index these routes answer 503 and the frontend falls back to the node API.

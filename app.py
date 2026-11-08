@@ -7,8 +7,12 @@ import requests_cache
 from dotenv import load_dotenv
 load_dotenv("local.env")
 
+from index_api import bp as index_bp
+
 app = Flask('__main__')
 cors = CORS(app)
+# optional /explorer/... routes, answer 503 until indexer.py has built its database
+app.register_blueprint(index_bp)
 method_requests_mapping = {
     'GET': requests.get,
     'HEAD': requests.head,
