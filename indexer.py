@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS moves (
 CREATE INDEX IF NOT EXISTS moves_from ON moves(from_addr, height);
 CREATE INDEX IF NOT EXISTS moves_to ON moves(to_addr, height);
 CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, updated INTEGER, data TEXT);
+CREATE TABLE IF NOT EXISTS registers (
+  address TEXT PRIMARY KEY, owner TEXT, kind TEXT, name TEXT, token TEXT, ticker TEXT,
+  balance REAL, info TEXT, created INTEGER, modified INTEGER);
+CREATE INDEX IF NOT EXISTS registers_owner ON registers(owner);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -269,7 +273,7 @@ def markets():
 ASSET_LISTS = ("assets:asset", "assets:raw", "assets:readonly", "supply:items")
 ASSET_TYPES = ("OBJECT", "RAW", "READONLY")
 LIST_LIMIT = 1000
-MAX_LIST_PAGES = 20
+MAX_LIST_PAGES = 1000
 
 
 def list_all(path):
@@ -310,24 +314,19 @@ def assets():
     return sorted(rows, key=lambda r: r.get("modified") or 0, reverse=True)
 
 
-HOLDERS_SECONDS = 3600
+OWNERS_SECONDS = 3600
 HOLDERS_TOP = 100
-MAX_ACCOUNT_PAGES = 1000
 
 
-def token_holders():
-    """Per token: holder count and the largest accounts; scans every account, about 35 s"""
+def token_holders(accounts_all):
+    """Per token: holder count and the largest accounts"""
     by_token = {}
-    for page in range(MAX_ACCOUNT_PAGES):
-        rows = api("register/list/finance:accounts", limit=LIST_LIMIT, page=page) or []
-        for a in rows:
-            token = str(a.get("token"))
-            if token != "0" and (a.get("balance") or 0) > 0:
-                by_token.setdefault(token, []).append(
-                    {"address": a.get("address"), "owner": a.get("owner"),
-                     "balance": a.get("balance"), "modified": a.get("modified")})
-        if len(rows) < LIST_LIMIT:
-            break
+    for a in accounts_all:
+        token = str(a.get("token"))
+        if token != "0" and (a.get("balance") or 0) > 0:
+            by_token.setdefault(token, []).append(
+                {"address": a.get("address"), "owner": a.get("owner"),
+                 "balance": a.get("balance"), "modified": a.get("modified")})
     out = {}
     for token, accounts in by_token.items():
         accounts.sort(key=lambda a: a["balance"], reverse=True)
@@ -335,6 +334,36 @@ def token_holders():
                       "owners": len({a["owner"] for a in accounts}),
                       "top": accounts[:HOLDERS_TOP]}
     return out
+
+
+def register_row(kind, r, name=None, info=None):
+    return (r.get("address"), r.get("owner"), kind, name if name is not None else r.get("name"),
+            str(r["token"]) if r.get("token") is not None else None, r.get("ticker"),
+            r.get("balance"), info, r.get("created"), r.get("modified"))
+
+
+def scan_owners(db):
+    """Fills the registers table (who owns what) and returns the token holders; about a minute"""
+    accounts_all = list_all("register/list/finance:accounts")
+    rows = [register_row("account", a) for a in accounts_all]
+    rows += [register_row("trust", t, info=json.dumps({"stake": t.get("stake"), "trust": t.get("trust")}))
+             for t in list_all("register/list/finance:trust")]
+    rows += [register_row("token", t, name=t.get("ticker"),
+                          info=json.dumps({"currentsupply": t.get("currentsupply"), "maxsupply": t.get("maxsupply")}))
+             for t in list_all("register/list/finance:tokens")]
+    for a in (asset_row(a) for path in ASSET_LISTS for a in list_all(f"register/list/{path}")):
+        rows.append((a["address"], a["owner"], "asset", a["label"] or a["name"], None, None, None,
+                     json.dumps({"format": a["type"], "kind": a["kind"]}), a["created"], a["modified"]))
+    for n in list_all("register/list/names:names") + list_all("register/list/names:global"):
+        rows.append(register_row("name", n, info=json.dumps({"register": n.get("register"),
+                                                             "global": bool(n.get("global"))})))
+    rows += [register_row("namespace", n, name=n.get("namespace"))
+             for n in list_all("register/list/names:namespaces")]
+    with db:
+        db.execute("DELETE FROM registers")
+        db.executemany("INSERT OR REPLACE INTO registers VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    log.info("owner index: %s registers", len(rows))
+    return token_holders(accounts_all)
 
 
 def cache_age(db, key):
@@ -356,10 +385,10 @@ def refresh_caches(db):
         "markets": markets,
         "assets": assets,
     }
-    #the full account scan only once an hour
+    #the full register scan only once an hour; token holders come out of it
     age = cache_age(db, "tokenholders")
-    if age is None or age >= HOLDERS_SECONDS:
-        jobs["tokenholders"] = token_holders
+    if age is None or age >= OWNERS_SECONDS:
+        jobs["tokenholders"] = lambda: scan_owners(db)
     for key, job in jobs.items():
         try:
             data = job()

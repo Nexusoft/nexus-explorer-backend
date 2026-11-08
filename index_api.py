@@ -98,6 +98,31 @@ def address_transactions(addr):
     return jsonify({"result": rows})
 
 
+OWNER_LIMIT = 1000
+
+
+@bp.route("/owner/<genesis>")
+def owner_registers(genesis):
+    """Registers owned by one signature chain, from the hourly owner index"""
+    con = db()
+    if not con:
+        return unavailable()
+    try:
+        with con:
+            total = con.execute("SELECT COUNT(*) FROM registers WHERE owner = ?", (genesis,)).fetchone()[0]
+            rows = con.execute(
+                "SELECT * FROM registers WHERE owner = ? "
+                "ORDER BY kind, COALESCE(balance, 0) DESC, modified DESC LIMIT ?",
+                (genesis, OWNER_LIMIT)).fetchall()
+            updated = con.execute("SELECT updated FROM cache WHERE key = 'tokenholders'").fetchone()
+    except sqlite3.OperationalError:
+        #index made by an indexer without the owner table
+        return unavailable()
+    regs = [{**dict(r), "info": json.loads(r["info"]) if r["info"] else None} for r in rows]
+    return jsonify({"result": {"registers": regs, "total": total,
+                               "updated": updated[0] if updated else None}})
+
+
 @bp.route("/cache/<key>")
 def cached(key):
     con = db()
