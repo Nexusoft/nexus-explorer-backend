@@ -237,6 +237,8 @@ def refresh_caches(db):
         "globalnames": lambda: api("register/list/names:global", limit=5000),
         "namespaces": lambda: api("register/list/names:namespaces", limit=5000),
         "tokens": lambda: api("register/list/finance:tokens", sort="maxsupply", limit=1000),
+        #takes the node over 30 s, too slow to ask per page view
+        "ledgermetrics": lambda: api("ledger/get/metrics"),
     }
     for key, job in jobs.items():
         try:
