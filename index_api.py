@@ -6,6 +6,8 @@ import time
 
 from flask import Blueprint, jsonify, request
 
+from indexer import REWARD_OPS
+
 INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
 MAX_LIMIT = 100
 
@@ -121,6 +123,61 @@ def owner_registers(genesis):
     regs = [{**dict(r), "info": json.loads(r["info"]) if r["info"] else None} for r in rows]
     return jsonify({"result": {"registers": regs, "total": total,
                                "updated": updated[0] if updated else None}})
+
+
+#registers whose value moves count as the chain's own
+VALUE_KINDS = ("account", "trust", "token")
+#two small queries per address; a chain with more registers gets its largest balances only
+MAX_OWNER_ADDRESSES = 500
+
+
+@bp.route("/owner/<genesis>/transactions")
+def owner_transactions(genesis):
+    """Value moves to or from any account, trust account or token of one signature chain"""
+    con = db()
+    if not con:
+        return unavailable()
+    limit = arg_int("limit", 25, 1, MAX_LIMIT)
+    before = arg_int("before", 2 ** 31)
+    try:
+        with con:
+            addrs = [r[0] for r in con.execute(
+                f"SELECT address FROM registers WHERE owner = ? AND kind IN ({','.join('?' * len(VALUE_KINDS))}) "
+                "ORDER BY COALESCE(balance, 0) DESC",
+                (genesis, *VALUE_KINDS))]
+            if not addrs:
+                return jsonify({"result": [], "addresses": [], "next": None})
+            addrs = addrs[:MAX_OWNER_ADDRESSES]
+            #one ordered index walk per address and side reads only `limit` rows each,
+            #one IN query would read every move of a busy trust account before sorting
+            #transfers=1 leaves out mining and staking rewards
+            no_rewards = (f" AND op NOT IN ({','.join('?' * len(REWARD_OPS))})"
+                          if request.args.get("transfers") == "1" else "")
+            ops = REWARD_OPS if no_rewards else ()
+            found = []
+            for col in ("from_addr", "to_addr"):
+                for a in addrs:
+                    found += con.execute(
+                        f"SELECT txid, height FROM moves WHERE {col} = ? AND height < ?{no_rewards} "
+                        "ORDER BY height DESC LIMIT ?", (a, before, *ops, limit)).fetchall()
+            found = sorted(set(found), key=lambda r: r[1], reverse=True)
+            full = len(found) > limit
+            found = found[:limit]
+            #finish the last block so before=<lowest height> never skips part of a block
+            if full:
+                last = found[-1][1]
+                for col in ("from_addr", "to_addr"):
+                    for a in addrs:
+                        found += con.execute(
+                            f"SELECT txid, height FROM moves WHERE {col} = ? AND height = ?{no_rewards}",
+                            (a, last, *ops)).fetchall()
+            ids = list(dict.fromkeys(r[0] for r in found))
+            id_marks = ",".join("?" * len(ids)) or "''"
+            rows = tx_rows(con, f"txid IN ({id_marks})", ids, len(ids) or 1)
+    except sqlite3.OperationalError:
+        return unavailable()
+    nxt = rows[-1]["height"] if full else None
+    return jsonify({"result": rows, "addresses": addrs, "next": nxt})
 
 
 @bp.route("/cache/<key>")
