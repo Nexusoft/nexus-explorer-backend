@@ -266,6 +266,46 @@ def markets():
     return out
 
 
+ASSET_LISTS = ("assets:asset", "assets:raw", "assets:readonly")
+ASSET_TYPES = ("OBJECT", "RAW", "READONLY")
+LIST_LIMIT = 1000
+MAX_LIST_PAGES = 20
+
+
+def list_all(path):
+    out = []
+    for page in range(MAX_LIST_PAGES):
+        rows = api(path, limit=LIST_LIMIT, page=page) or []
+        out += rows
+        if len(rows) < LIST_LIMIT:
+            break
+    return out
+
+
+def asset_row(a):
+    #RAW/READONLY assets keep their content in "json", objects in their own fields
+    content = a.get("json") if isinstance(a.get("json"), dict) else {}
+    fmt = a.get("type")
+    #an object can have its own field called "type", which then hides the register type
+    own_type = None
+    if fmt not in ASSET_TYPES:
+        own_type, fmt = fmt, "OBJECT"
+    kind = a.get("distordia-type") or content.get("type") or own_type
+    if not kind and a.get("bounty_id"):
+        kind = "bounty"
+    label = a.get("title") or content.get("title") or content.get("name") or a.get("name")
+    return {"address": a.get("address"), "name": a.get("name"),
+            "label": label if isinstance(label, str) else None,
+            "kind": kind if isinstance(kind, str) else None, "type": fmt,
+            "owner": a.get("owner"), "created": a.get("created"), "modified": a.get("modified")}
+
+
+def assets():
+    """Every asset register, newest change first, without its content"""
+    rows = [asset_row(a) for path in ASSET_LISTS for a in list_all(f"register/list/{path}")]
+    return sorted(rows, key=lambda r: r.get("modified") or 0, reverse=True)
+
+
 def refresh_caches(db):
     jobs = {
         "richlist": lambda: api("register/list/finance:accounts,finance:trust",
@@ -278,6 +318,7 @@ def refresh_caches(db):
         #takes the node over 30 s, too slow to ask per page view
         "ledgermetrics": lambda: api("ledger/get/metrics"),
         "markets": markets,
+        "assets": assets,
     }
     for key, job in jobs.items():
         try:
