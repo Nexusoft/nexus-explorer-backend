@@ -310,6 +310,38 @@ def assets():
     return sorted(rows, key=lambda r: r.get("modified") or 0, reverse=True)
 
 
+HOLDERS_SECONDS = 3600
+HOLDERS_TOP = 100
+MAX_ACCOUNT_PAGES = 1000
+
+
+def token_holders():
+    """Per token: holder count and the largest accounts; scans every account, about 35 s"""
+    by_token = {}
+    for page in range(MAX_ACCOUNT_PAGES):
+        rows = api("register/list/finance:accounts", limit=LIST_LIMIT, page=page) or []
+        for a in rows:
+            token = str(a.get("token"))
+            if token != "0" and (a.get("balance") or 0) > 0:
+                by_token.setdefault(token, []).append(
+                    {"address": a.get("address"), "owner": a.get("owner"),
+                     "balance": a.get("balance"), "modified": a.get("modified")})
+        if len(rows) < LIST_LIMIT:
+            break
+    out = {}
+    for token, accounts in by_token.items():
+        accounts.sort(key=lambda a: a["balance"], reverse=True)
+        out[token] = {"accounts": len(accounts),
+                      "owners": len({a["owner"] for a in accounts}),
+                      "top": accounts[:HOLDERS_TOP]}
+    return out
+
+
+def cache_age(db, key):
+    row = db.execute("SELECT updated FROM cache WHERE key=?", (key,)).fetchone()
+    return time.time() - row[0] if row else None
+
+
 def refresh_caches(db):
     jobs = {
         "richlist": lambda: api("register/list/finance:accounts,finance:trust",
@@ -324,6 +356,10 @@ def refresh_caches(db):
         "markets": markets,
         "assets": assets,
     }
+    #the full account scan only once an hour
+    age = cache_age(db, "tokenholders")
+    if age is None or age >= HOLDERS_SECONDS:
+        jobs["tokenholders"] = token_holders
     for key, job in jobs.items():
         try:
             data = job()

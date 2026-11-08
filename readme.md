@@ -30,7 +30,8 @@ To increase number of worker threads for gunicorn3 use -w option.
 blocks, transactions and value moves for the whole chain, plus cached copies of the slow
 register lists (rich list, trust list, global names, namespaces, tokens, assets and supply items), of the ledger
 metrics and of the on-chain market (open and filled orders of every NXS/<token> pair),
-refreshed every 10 minutes.
+refreshed every 10 minutes. Token holders (holder count and largest accounts of every
+token) come from a scan of all accounts, about 35 s, and are refreshed once an hour.
 
 ```
 python indexer.py
@@ -42,6 +43,6 @@ It follows the tip every 10 seconds and backfills older blocks in the background
 - `GET /explorer/status` - indexed height range and cache times
 - `GET /explorer/transactions?limit=25&transfers=1&before=<height>` - newest first, `next` = cursor for the following page
 - `GET /explorer/address/<address>/transactions?limit=25&before=<height>`
-- `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens|ledgermetrics|markets|assets>`
+- `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens|ledgermetrics|markets|assets|tokenholders>`
 
 Without the index these routes answer 503 and the frontend falls back to the node API.
