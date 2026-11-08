@@ -228,6 +228,44 @@ def backfill(db, budget_seconds=20):
     return True
 
 
+NXS_UNITS = 1e6
+MARKET_LIMIT = 500
+
+
+def market_side(c):
+    #market/list gives NXS amounts in base units and token amounts in whole units
+    amount = c.get("amount") or 0
+    if str(c.get("token")) == "0":
+        amount = amount / NXS_UNITS
+    return {"amount": amount, "ticker": c.get("ticker"), "token": c.get("token"),
+            "account": c.get("from") or c.get("to")}
+
+
+def market_order(o):
+    return {"txid": o.get("txid"), "timestamp": o.get("timestamp"), "owner": o.get("owner"),
+            "type": o.get("type"), "give": market_side(o.get("contract") or {}),
+            "want": market_side(o.get("order") or {})}
+
+
+def markets():
+    """Open orders and filled orders of every NXS/<ticker> pair that has any"""
+    tokens = api("register/list/finance:tokens", limit=1000)
+    out = []
+    for ticker in sorted({t["ticker"] for t in tokens if t.get("ticker")}):
+        pair = f"NXS/{ticker}"
+        try:
+            book = api("market/list/order", market=pair, limit=MARKET_LIMIT)
+            done = api("market/list/executed", market=pair, limit=MARKET_LIMIT)
+        except Exception as e:
+            log.debug("market %s: %s", pair, e)
+            continue
+        orders = [market_order(o) for k in ("asks", "bids") for o in book.get(k) or []]
+        executed = [market_order(o) for k in ("asks", "bids") for o in done.get(k) or []]
+        if orders or executed:
+            out.append({"market": pair, "orders": orders, "executed": executed})
+    return out
+
+
 def refresh_caches(db):
     jobs = {
         "richlist": lambda: api("register/list/finance:accounts,finance:trust",
@@ -239,6 +277,7 @@ def refresh_caches(db):
         "tokens": lambda: api("register/list/finance:tokens", sort="maxsupply", limit=1000),
         #takes the node over 30 s, too slow to ask per page view
         "ledgermetrics": lambda: api("ledger/get/metrics"),
+        "markets": markets,
     }
     for key, job in jobs.items():
         try:

@@ -28,8 +28,9 @@ To increase number of worker threads for gunicorn3 use -w option.
 
 `indexer.py` keeps a SQLite index next to the node (`INDEX_DB`, default `explorer_index.sqlite`):
 blocks, transactions and value moves for the whole chain, plus cached copies of the slow
-register lists (rich list, trust list, global names, namespaces, tokens) and of the ledger
-metrics, refreshed every 10 minutes.
+register lists (rich list, trust list, global names, namespaces, tokens), of the ledger
+metrics and of the on-chain market (open and filled orders of every NXS/<token> pair),
+refreshed every 10 minutes.
 
 ```
 python indexer.py
@@ -41,6 +42,6 @@ It follows the tip every 10 seconds and backfills older blocks in the background
 - `GET /explorer/status` - indexed height range and cache times
 - `GET /explorer/transactions?limit=25&transfers=1&before=<height>` - newest first, `next` = cursor for the following page
 - `GET /explorer/address/<address>/transactions?limit=25&before=<height>`
-- `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens|ledgermetrics>`
+- `GET /explorer/cache/<richlist|trustlist|globalnames|namespaces|tokens|ledgermetrics|markets>`
 
 Without the index these routes answer 503 and the frontend falls back to the node API.
