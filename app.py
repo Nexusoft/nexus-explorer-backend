@@ -39,7 +39,7 @@ def proxy(path):
                                 headers=request.headers,
                                 params=request.args,
                                 data=request.data,
-                                json=request.json)
+                                json=request.get_json(silent=True))
         return _corsify_actual_response(resp)
 
 
@@ -52,8 +52,13 @@ def _build_cors_preflight_response():
 
 
 def _corsify_actual_response(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response.json()
+    # keep the node's status code so clients can tell errors (e.g. not found) from results
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"error": {"code": response.status_code, "message": response.text[:500]}}
+    # flask-cors adds Access-Control-Allow-Origin itself
+    return make_response(body, response.status_code)
 
 
 def main():
