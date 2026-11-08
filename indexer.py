@@ -266,7 +266,7 @@ def markets():
     return out
 
 
-ASSET_LISTS = ("assets:asset", "assets:raw", "assets:readonly")
+ASSET_LISTS = ("assets:asset", "assets:raw", "assets:readonly", "supply:items")
 ASSET_TYPES = ("OBJECT", "RAW", "READONLY")
 LIST_LIMIT = 1000
 MAX_LIST_PAGES = 20
@@ -290,10 +290,14 @@ def asset_row(a):
     own_type = None
     if fmt not in ASSET_TYPES:
         own_type, fmt = fmt, "OBJECT"
+    #supply items are objects too, told apart only by their form
+    if a.get("form") == "SUPPLY":
+        fmt = "SUPPLY"
     kind = a.get("distordia-type") or content.get("type") or own_type
     if not kind and a.get("bounty_id"):
         kind = "bounty"
-    label = a.get("title") or content.get("title") or content.get("name") or a.get("name")
+    label = (a.get("title") or content.get("title") or content.get("name") or a.get("question")
+             or a.get("name"))
     return {"address": a.get("address"), "name": a.get("name"),
             "label": label if isinstance(label, str) else None,
             "kind": kind if isinstance(kind, str) else None, "type": fmt,
@@ -301,7 +305,7 @@ def asset_row(a):
 
 
 def assets():
-    """Every asset register, newest change first, without its content"""
+    """Every asset and supply item register, newest change first, without its content"""
     rows = [asset_row(a) for path in ASSET_LISTS for a in list_all(f"register/list/{path}")]
     return sorted(rows, key=lambda r: r.get("modified") or 0, reverse=True)
 

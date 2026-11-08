@@ -28,7 +28,7 @@ To increase number of worker threads for gunicorn3 use -w option.
 
 `indexer.py` keeps a SQLite index next to the node (`INDEX_DB`, default `explorer_index.sqlite`):
 blocks, transactions and value moves for the whole chain, plus cached copies of the slow
-register lists (rich list, trust list, global names, namespaces, tokens, assets), of the ledger
+register lists (rich list, trust list, global names, namespaces, tokens, assets and supply items), of the ledger
 metrics and of the on-chain market (open and filled orders of every NXS/<token> pair),
 refreshed every 10 minutes.
 
