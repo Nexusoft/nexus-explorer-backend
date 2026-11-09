@@ -137,6 +137,24 @@ def address_transactions(addr):
     return jsonify({"result": rows, "next": nxt})
 
 
+@bp.route("/address/<addr>/rewards")
+def address_rewards(addr):
+    """Staking rewards of a trust account per UTC month: [month, rewards, NXS]"""
+    con = db()
+    if not con:
+        return unavailable()
+    with con:
+        rows = con.execute(
+            "SELECT strftime('%Y-%m', time, 'unixepoch') AS m, COUNT(*), SUM(amount) FROM moves "
+            f"WHERE to_addr = ? AND op IN ({marks(REWARD_OPS)}) GROUP BY m ORDER BY m",
+            (addr, *REWARD_OPS)).fetchall()
+        last = con.execute(
+            f"SELECT COUNT(*), SUM(amount) FROM moves WHERE to_addr = ? AND op IN ({marks(REWARD_OPS)}) "
+            "AND time >= ?", (addr, *REWARD_OPS, int(time.time()) - 30 * 86400)).fetchone()
+    return jsonify({"result": [[m, n, round(s or 0, 6)] for m, n, s in rows],
+                    "last30": {"count": last[0], "amount": round(last[1] or 0, 6)}})
+
+
 @bp.route("/register/<register_id>")
 def register_by_id(register_id):
     """Base58 address of a register given in its 64 hex form (owner of a tokenized register)"""
