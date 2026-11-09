@@ -8,6 +8,7 @@ list transfers across the whole chain, and caches the slow register lists
 
 The Flask app (app.py) serves the data under /explorer/... when INDEX_DB exists.
 """
+import heapq
 import json
 import logging
 import os
@@ -77,6 +78,8 @@ def connect(path=INDEX_DB):
     if get_meta(db, "tx_kinds_filled") is None:
         fill_tx_kinds(db)
     db.execute("CREATE INDEX IF NOT EXISTS txs_kind ON txs(kind, height)")
+    #covering index for largest_payments
+    db.execute("CREATE INDEX IF NOT EXISTS txs_amount ON txs(kind, amount, time, ops)")
     if get_meta(db, "legacy_rewards_fixed") is None:
         fix_legacy_rewards(db)
     if get_meta(db, "migrate_moves_fixed") is None:
@@ -85,6 +88,11 @@ def connect(path=INDEX_DB):
         except UNREADABLE as e:
             #node not reachable, the next start tries again
             log.warning("MIGRATE fix postponed: %s", str(e).split(" for url:")[0])
+    if get_meta(db, "unnamed_token_kinds_fixed") is None:
+        try:
+            fix_unnamed_token_kinds(db)
+        except UNREADABLE as e:
+            log.warning("token kind fix postponed: %s", str(e).split(" for url:")[0])
     return db
 
 
@@ -97,6 +105,15 @@ def fix_migrate_moves(db):
                 db.execute("UPDATE moves SET to_addr = ?, to_name = ? WHERE txid = ? AND idx = ?",
                            (c.get("address"), c.get("name"), txid, i))
     set_meta(db, "migrate_moves_fixed", 1)
+    db.commit()
+
+
+def fix_unnamed_token_kinds(db):
+    """Kinds filled before moves_token(): moves of tokens without a ticker were payments"""
+    for (txid,) in db.execute("SELECT txid FROM txs WHERE kind = 'payment' AND ticker IS NULL").fetchall():
+        if moves_token(api("ledger/get/transaction", txid=txid)):
+            db.execute("UPDATE txs SET kind = 'token' WHERE txid = ?", (txid,))
+    set_meta(db, "unnamed_token_kinds_fixed", 1)
     db.commit()
 
 
@@ -187,7 +204,13 @@ def moves_of(tx):
 TX_KINDS = ("reward", "legacy", "ownership", "register", "token", "payment", "other")
 
 
-def tx_kind(tx_type, reward, ops, ticker):
+def moves_token(tx):
+    """true when a contract moves a token other than NXS (token "0"); unnamed tokens have no ticker"""
+    return any(isinstance(c, dict) and (c.get("token") or "0") != "0"
+               for c in tx.get("contracts") or [])
+
+
+def tx_kind(tx_type, reward, ops, ticker, token=False):
     """One kind per transaction from its stored fields (also used to fill old rows)"""
     ops = set((ops or "").split(","))
     if reward:
@@ -198,7 +221,7 @@ def tx_kind(tx_type, reward, ops, ticker):
         return "ownership"
     if ops & {"CREATE", "WRITE", "APPEND"}:
         return "register"
-    if ticker and ticker != "NXS":
+    if token or (ticker and ticker != "NXS"):
         return "token"
     if ops & {"DEBIT", "CREDIT", "LEGACY"}:
         return "payment"
@@ -236,7 +259,7 @@ def store_block(db, b):
                    "amount, ticker, ops, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (tx["txid"], b["height"], tx.get("timestamp"), tx.get("type"),
                     len(tx.get("contracts") or []), reward, amount, ticker, ops,
-                    tx_kind(tx.get("type"), reward, ops, ticker)))
+                    tx_kind(tx.get("type"), reward, ops, ticker, moves_token(tx))))
         db.executemany("INSERT OR REPLACE INTO moves VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        [(tx["txid"], i, b["height"], tx.get("timestamp"), *m) for i, m in enumerate(mv)])
 
@@ -651,6 +674,65 @@ def start_legacy_rich(db):
     legacy_rich_thread.start()
 
 
+#days, 0 = all time
+LARGEST_PERIODS = (7, 30, 365, 0)
+LARGEST_ROWS = 50
+#txs.amount counts legacy change too, so more rows than shown are re-ranked by moved()
+LARGEST_CANDIDATES = 300
+
+
+def moved(moves):
+    """NXS a payment moves: its DEBITs, or legacy outputs minus change (outputs to an input address)"""
+    if any(m["op"] == "LEGACY" for m in moves):
+        spenders = {m["from_addr"] for m in moves if m["op"] == "LEGACY_IN"}
+        return sum(m["amount"] or 0 for m in moves
+                   if m["op"] == "LEGACY" and m["to_addr"] not in spenders)
+    return sum(m["amount"] or 0 for m in moves if m["op"] == "DEBIT")
+
+
+def rows_as_dicts(cursor):
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, r)) for r in cursor]
+
+
+def largest_payments(db):
+    """Largest NXS payments per period, one pass over the payment rows: {"<days>": [tx with moves
+    and moved]}; token payments have their own kind and are not counted"""
+    now = int(time.time())
+    cutoffs = {d: now - d * DAY if d else 0 for d in LARGEST_PERIODS}
+    tops = {d: [] for d in LARGEST_PERIODS}
+    #reads only the covering index txs_amount, not the scattered table rows
+    for rowid, t, amount in db.execute(
+            "SELECT rowid, time, amount FROM txs INDEXED BY txs_amount "
+            "WHERE kind IN ('payment', 'legacy') AND (ops LIKE '%DEBIT%' OR ops LIKE '%LEGACY%')"):
+        item = (amount or 0, rowid)
+        for d, cut in cutoffs.items():
+            if (t or 0) >= cut:
+                if len(tops[d]) < LARGEST_CANDIDATES:
+                    heapq.heappush(tops[d], item)
+                elif item > tops[d][0]:
+                    heapq.heapreplace(tops[d], item)
+    rowids = list({rowid for heap in tops.values() for _a, rowid in heap})
+    txs, by_txid = {}, {}
+    if rowids:
+        for r in rows_as_dicts(db.execute(
+                f"SELECT rowid AS rid, * FROM txs WHERE rowid IN ({','.join('?' * len(rowids))})", rowids)):
+            rid = r.pop("rid")
+            txs[rid] = by_txid[r["txid"]] = {**r, "moves": []}
+        ids = list(by_txid)
+        for m in rows_as_dicts(db.execute(
+                f"SELECT * FROM moves WHERE txid IN ({','.join('?' * len(ids))}) ORDER BY idx", ids)):
+            by_txid[m["txid"]]["moves"].append(m)
+    for tx in txs.values():
+        tx["moved"] = round(moved(tx["moves"]), 6)
+    out = {}
+    for d, heap in tops.items():
+        rows = sorted((txs[i] for _a, i in heap if txs[i]["moved"] > 0),
+                      key=lambda r: r["moved"], reverse=True)
+        out[str(d)] = rows[:LARGEST_ROWS]
+    return out
+
+
 def refresh_caches(db):
     jobs = {
         "richlist": lambda: api("register/list/finance:accounts,finance:trust",
@@ -665,6 +747,8 @@ def refresh_caches(db):
         "markets": markets,
         "assets": assets,
         "daily": lambda: update_daily(db),
+        #under a second on mainnet with txs_amount
+        "largest": lambda: largest_payments(db),
     }
     #the full register scan only once an hour; token holders come out of it
     age = cache_age(db, "tokenholders")

@@ -6,7 +6,7 @@ import time
 
 from flask import Blueprint, jsonify, request
 
-from indexer import REWARD_OPS, TX_KINDS, api
+from indexer import LARGEST_PERIODS, LARGEST_ROWS, REWARD_OPS, TX_KINDS, api
 
 INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
 MAX_LIMIT = 100
@@ -90,6 +90,25 @@ def transactions():
 
 def marks(values):
     return ",".join("?" * len(values))
+
+
+@bp.route("/largest")
+def largest():
+    """Largest NXS payments of the last 7, 30 or 365 days or of all time (days=0), from the
+    indexer cache (largest_payments, every 10 minutes)"""
+    con = db()
+    if not con:
+        return unavailable()
+    days = arg_int("days", 30)
+    if days not in LARGEST_PERIODS:
+        days = 30
+    limit = arg_int("limit", 25, 1, LARGEST_ROWS)
+    with con:
+        row = con.execute("SELECT updated, data FROM cache WHERE key = 'largest'").fetchone()
+    if not row:
+        return jsonify({"result": None, "days": days, "updated": None})
+    rows = json.loads(row["data"]).get(str(days), [])
+    return jsonify({"result": rows[:limit], "days": days, "updated": row["updated"]})
 
 
 def moves_page(con, addrs, before, limit, ops=None, skip_ops=None):

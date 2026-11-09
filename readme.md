@@ -44,6 +44,7 @@ It follows the tip every 10 seconds and backfills older blocks in the background
 
 - `GET /explorer/status` - indexed height range and cache times
 - `GET /explorer/transactions?limit=25&transfers=1&kind=<kind>&before=<height>` - newest first, `next` = cursor for the following page; `kind` = payment, token, register (created or changed), ownership (transfer or claim), legacy, reward or other, one per transaction, stored by the indexer
+- `GET /explorer/largest?days=<7|30|365|0>&limit=25` - largest NXS payments of that period (0 = all time, up to 50), `moved` = NXS debited, or legacy outputs without change (outputs back to an input address); worked out by the indexer every 10 minutes (`updated`), `result: null` before its first run. Moves of tokens, named or not, are `token` transactions and do not count
 - `GET /explorer/address/<address>/transactions?limit=25&registers=1&before=<height>` - newest first, `registers=1` = only operations on the register itself (create, write, append, transfer, claim: its history), `next` = cursor
 - `GET /explorer/address/<address>/rewards` - staking rewards of a trust account per UTC month (`[month, rewards, NXS]`) and `last30` = count and NXS of the last 30 days
 - `GET /explorer/legacy/<address>` - a legacy (pre Tritium) address: received (its outputs), spent (the inputs that spent them), balance, first and last activity; `complete` = legacy inputs are indexed down to genesis
