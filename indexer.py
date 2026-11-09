@@ -26,6 +26,8 @@ FOLLOW_SECONDS = 10
 CACHE_SECONDS = 600
 REORG_DEPTH = 20
 REWARD_OPS = ("COINBASE", "TRUST", "GENESIS")
+#pre Tritium mining, staking and first staking rewards carry no contracts, only a type
+LEGACY_REWARD_TYPES = ("legacy base", "legacy trust", "legacy genesis")
 #node answers 500 or drops the connection on transactions it cannot decode
 UNREADABLE = (requests.HTTPError, requests.ConnectionError)
 
@@ -52,6 +54,10 @@ CREATE TABLE IF NOT EXISTS registers (
   balance REAL, info TEXT, created INTEGER, modified INTEGER, id TEXT);
 CREATE INDEX IF NOT EXISTS registers_owner ON registers(owner);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS daily (
+  day INTEGER PRIMARY KEY, first_height INTEGER,
+  blocks_stake INTEGER, blocks_prime INTEGER, blocks_hash INTEGER,
+  mint_stake REAL, mint_prime REAL, mint_hash REAL, txs INTEGER, transfers INTEGER);
 """
 
 
@@ -64,7 +70,23 @@ def connect(path=INDEX_DB):
     if "id" not in [c[1] for c in db.execute("PRAGMA table_info(registers)")]:
         db.execute("ALTER TABLE registers ADD COLUMN id TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS registers_id ON registers(id)")
+    if get_meta(db, "legacy_rewards_fixed") is None:
+        fix_legacy_rewards(db)
     return db
+
+
+def fix_legacy_rewards(db, step=100000):
+    """Indexes made before LEGACY_REWARD_TYPES stored legacy rewards as transfers"""
+    marks = ",".join("?" * len(LEGACY_REWARD_TYPES))
+    top = db.execute("SELECT MAX(height) FROM txs").fetchone()[0] or 0
+    for low in range(0, top + 1, step):
+        db.execute(f"UPDATE txs SET is_reward = 1 WHERE height >= ? AND height < ? AND is_reward = 0 "
+                   f"AND type IN ({marks})", (low, low + step, *LEGACY_REWARD_TYPES))
+        db.commit()
+    #the per day transfer counts came from the same flag
+    db.execute("DELETE FROM daily")
+    set_meta(db, "legacy_rewards_fixed", 1)
+    db.commit()
 
 
 BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -103,6 +125,8 @@ def reward_contract(c):
 
 def is_reward(tx):
     """only rewards (a fee next to a reward claim does not make it a transfer)"""
+    if tx.get("type") in LEGACY_REWARD_TYPES:
+        return True
     contracts = tx.get("contracts") or []
     return any(reward_contract(c) for c in contracts) and all(
         reward_contract(c) or c.get("OP") == "FEE" for c in contracts)
@@ -401,6 +425,44 @@ def cache_age(db, key):
     return time.time() - row[0] if row else None
 
 
+DAY = 86400
+
+
+def update_daily(db):
+    """Per UTC day: blocks and minted NXS per channel, transactions, transfers. The first run
+    reads the whole chain (minutes); later runs redo only the last two stored days."""
+    if get_meta(db, "backfill_low") not in ("0", "1"):
+        return None  #days before the backfilled part would be counted short
+    last = db.execute("SELECT MAX(day) FROM daily").fetchone()[0]
+    start = 0
+    if last is not None:
+        row = db.execute("SELECT first_height FROM daily WHERE day = ?", (last - 1,)).fetchone()
+        start = row[0] if row else 0
+    days = {}
+    for day, channel, n, mint, height in db.execute(
+            "SELECT time / ?, channel, COUNT(*), SUM(mint), MIN(height) FROM blocks "
+            "WHERE height >= ? GROUP BY time / ?, channel", (DAY, start, DAY)):
+        d = days.setdefault(day, {"first": height, "blocks": [0, 0, 0], "mint": [0.0, 0.0, 0.0],
+                                  "txs": 0, "transfers": 0})
+        d["first"] = min(d["first"], height)
+        if channel in (0, 1, 2):
+            d["blocks"][channel] = n
+            d["mint"][channel] = mint or 0.0
+    for day, n, transfers in db.execute(
+            "SELECT time / ?, COUNT(*), SUM(is_reward = 0 AND type != 'unreadable') FROM txs "
+            "WHERE height >= ? GROUP BY time / ?", (DAY, start, DAY)):
+        if day in days:
+            days[day]["txs"], days[day]["transfers"] = n, transfers or 0
+    with db:
+        db.executemany("INSERT OR REPLACE INTO daily VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       [(day, d["first"], *d["blocks"], *(round(m, 6) for m in d["mint"]),
+                         d["txs"], d["transfers"]) for day, d in days.items()])
+    #[day, stake, prime, hash blocks, stake, prime, hash mint, txs, transfers]
+    return [list(r) for r in db.execute(
+        "SELECT day, blocks_stake, blocks_prime, blocks_hash, mint_stake, mint_prime, mint_hash, "
+        "txs, transfers FROM daily ORDER BY day")]
+
+
 def refresh_caches(db):
     jobs = {
         "richlist": lambda: api("register/list/finance:accounts,finance:trust",
@@ -414,6 +476,7 @@ def refresh_caches(db):
         "ledgermetrics": lambda: api("ledger/get/metrics"),
         "markets": markets,
         "assets": assets,
+        "daily": lambda: update_daily(db),
     }
     #the full register scan only once an hour; token holders come out of it
     age = cache_age(db, "tokenholders")
@@ -422,6 +485,8 @@ def refresh_caches(db):
     for key, job in jobs.items():
         try:
             data = job()
+            if data is None:
+                continue
             db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)", (key, int(time.time()), json.dumps(data)))
             db.commit()
         except Exception as e:
