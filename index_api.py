@@ -6,7 +6,7 @@ import time
 
 from flask import Blueprint, jsonify, request
 
-from indexer import LARGEST_PERIODS, LARGEST_ROWS, REWARD_OPS, TX_KINDS, api
+from indexer import LARGEST_PERIODS, LARGEST_ROWS, REWARD_OPS, TX_KINDS, api, legacy_inputs_low
 
 INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
 MAX_LIMIT = 100
@@ -39,7 +39,8 @@ def arg_int(name, default, lo=0, hi=None):
 def status():
     con = db()
     if not con:
-        return unavailable()
+        #no index is an answer here, not an error: the frontend asks this first
+        return jsonify({"result": None})
     with con:
         high = con.execute("SELECT MAX(height) FROM blocks").fetchone()[0]
         low = con.execute("SELECT value FROM meta WHERE key='backfill_low'").fetchone()
@@ -191,7 +192,7 @@ def legacy_address(addr):
                           "WHERE to_addr = ? AND op = 'LEGACY'", (addr,)).fetchone()
         spent = con.execute("SELECT COUNT(*), SUM(amount), MIN(time), MAX(time) FROM moves "
                             "WHERE from_addr = ? AND op = 'LEGACY_IN'", (addr,)).fetchone()
-        low = con.execute("SELECT value FROM meta WHERE key = 'legacy_inputs_low'").fetchone()
+        low = legacy_inputs_low(con)
     received, spent_amount = got[1] or 0, spent[1] or 0
     times = [t for t in (got[2], got[3], spent[2], spent[3]) if t]
     return jsonify({"result": {
@@ -199,7 +200,7 @@ def legacy_address(addr):
         "received": round(received, 6), "spent": round(spent_amount, 6),
         "balance": round(received - spent_amount, 6),
         "first": min(times) if times else None, "last": max(times) if times else None,
-        "complete": bool(low) and int(low[0]) <= 1}})
+        "complete": low <= 1}})
 
 
 @bp.route("/register/<register_id>")

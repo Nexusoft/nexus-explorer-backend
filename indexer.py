@@ -63,11 +63,29 @@ CREATE TABLE IF NOT EXISTS daily (
 """
 
 
+#one time fixes of older indexes, and legacy inputs stored by the backfill itself
+NEW_INDEX_DONE = ("tx_kinds_filled", "legacy_rewards_fixed", "migrate_moves_fixed",
+                  "unnamed_token_kinds_fixed", "mixed_token_kinds_fixed", "legacy_inputs_from_start")
+
+
+def legacy_inputs_low(db):
+    """Height down to which legacy inputs are stored: the repair of an old index, or the
+    backfill of an index that stored them from the start"""
+    key = "backfill_low" if get_meta(db, "legacy_inputs_from_start") else "legacy_inputs_low"
+    return int(get_meta(db, key, str(2 ** 31)) or 2 ** 31)
+
+
 def connect(path=INDEX_DB):
     db = sqlite3.connect(path, timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.executescript(SCHEMA)
+    #a new index stores everything the one time fixes below repair in old ones
+    if db.execute("SELECT COUNT(*) FROM meta").fetchone()[0] == 0 and \
+            db.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 0:
+        for key in NEW_INDEX_DONE:
+            set_meta(db, key, 1)
+        db.commit()
     #registers made before the id column
     if "id" not in [c[1] for c in db.execute("PRAGMA table_info(registers)")]:
         db.execute("ALTER TABLE registers ADD COLUMN id TEXT")
@@ -93,6 +111,8 @@ def connect(path=INDEX_DB):
             fix_unnamed_token_kinds(db)
         except UNREADABLE as e:
             log.warning("token kind fix postponed: %s", str(e).split(" for url:")[0])
+    if get_meta(db, "mixed_token_kinds_fixed") is None:
+        fix_mixed_token_kinds(db)
     return db
 
 
@@ -115,6 +135,20 @@ def fix_unnamed_token_kinds(db):
             db.execute("UPDATE txs SET kind = 'token' WHERE txid = ?", (txid,))
     set_meta(db, "unnamed_token_kinds_fixed", 1)
     db.commit()
+
+
+def fix_mixed_token_kinds(db):
+    """Kinds filled before moves_token() looked at the first move's ticker only: a payment
+    with NXS first and a token after it is a token transaction"""
+    ids = [r[0] for r in db.execute(
+        "SELECT txid FROM txs WHERE kind = 'payment' AND ticker = 'NXS' AND contracts > 1")]
+    mixed = [(t,) for t in ids if db.execute(
+        "SELECT 1 FROM moves WHERE txid = ? AND ticker IS NOT NULL AND ticker != 'NXS' LIMIT 1",
+        (t,)).fetchone()]
+    db.executemany("UPDATE txs SET kind = 'token' WHERE txid = ?", mixed)
+    set_meta(db, "mixed_token_kinds_fixed", 1)
+    db.commit()
+    return len(mixed)
 
 
 def fix_legacy_rewards(db, step=100000):
@@ -357,6 +391,8 @@ def repair_legacy_inputs(db, budget_seconds=20):
     """Indexes made before LEGACY_IN have no legacy inputs: store those blocks again
     (store_block replaces rows). Scattered blocks above LEGACY_DENSE_BELOW one by one,
     then the legacy era page by page like the backfill"""
+    if get_meta(db, "legacy_inputs_from_start"):
+        return False
     start = time.time()
     low = int(get_meta(db, "legacy_sparse_low", "0") or 0)
     if low == 0:
@@ -650,7 +686,7 @@ def legacy_rich():
 def start_legacy_rich(db):
     """Daily, once the legacy inputs are complete, in a thread so the tip is followed"""
     global legacy_rich_thread
-    if int(get_meta(db, "legacy_inputs_low", "2") or 2) > 1:
+    if legacy_inputs_low(db) > 1:
         return
     if legacy_rich_thread and legacy_rich_thread.is_alive():
         return
@@ -777,9 +813,8 @@ def main():
                 refresh_caches(db)
                 last_cache = time.time()
             busy = backfill(db) or repair_legacy_inputs(db)
-            log.info("indexed down to %s, legacy inputs down to %s / %s",
-                     get_meta(db, "backfill_low"), get_meta(db, "legacy_sparse_low"),
-                     get_meta(db, "legacy_inputs_low"))
+            log.info("indexed down to %s, legacy inputs down to %s",
+                     get_meta(db, "backfill_low"), legacy_inputs_low(db))
             if not busy:
                 time.sleep(FOLLOW_SECONDS)
         except Exception as e:
