@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 
 import requests
@@ -551,6 +552,61 @@ def update_daily(db):
         "txs, transfers FROM daily ORDER BY day")]
 
 
+LEGACY_RICH = 500
+LEGACY_RICH_SECONDS = 86400
+legacy_rich_thread = None
+
+
+def legacy_rich():
+    """Balance of every legacy address (outputs to it minus inputs it spent): {total,
+    addresses with NXS, negative = addresses below zero (index gap), top}. One full pass
+    over moves, minutes, so it runs on its own read only connection"""
+    con = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True, timeout=30)
+    bal = {}
+    for addr, amount in con.execute(
+            "SELECT to_addr, SUM(amount) FROM moves WHERE op = 'LEGACY' GROUP BY to_addr"):
+        #outputs to a Tritium account (8...) are claimed into it, not kept at an address
+        if addr and not addr.startswith("8"):
+            bal[addr] = bal.get(addr, 0.0) + (amount or 0)
+    for addr, amount in con.execute(
+            "SELECT from_addr, SUM(amount) FROM moves WHERE op = 'LEGACY_IN' GROUP BY from_addr"):
+        if addr:
+            bal[addr] = bal.get(addr, 0.0) - (amount or 0)
+    con.close()
+    held = sorted(((a, round(b, 6)) for a, b in bal.items() if b > 1e-6),
+                  key=lambda x: x[1], reverse=True)
+    return {"total": round(sum(b for _a, b in held), 6), "addresses": len(held),
+            "negative": sum(1 for b in bal.values() if b < -1e-6),
+            "top": [{"address": a, "balance": b} for a, b in held[:LEGACY_RICH]]}
+
+
+def start_legacy_rich(db):
+    """Daily, once the legacy inputs are complete, in a thread so the tip is followed"""
+    global legacy_rich_thread
+    if int(get_meta(db, "legacy_inputs_low", "2") or 2) > 1:
+        return
+    if legacy_rich_thread and legacy_rich_thread.is_alive():
+        return
+    age = cache_age(db, "legacyrich")
+    if age is not None and age < LEGACY_RICH_SECONDS:
+        return
+
+    def run():
+        try:
+            data = legacy_rich()
+            con = sqlite3.connect(INDEX_DB, timeout=60)
+            with con:
+                con.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)",
+                            ("legacyrich", int(time.time()), json.dumps(data)))
+            con.close()
+            log.info("legacy rich list: %s addresses, %s NXS", data["addresses"], data["total"])
+        except Exception as e:
+            log.warning("legacy rich list failed: %s", e)
+
+    legacy_rich_thread = threading.Thread(target=run, daemon=True)
+    legacy_rich_thread.start()
+
+
 def refresh_caches(db):
     jobs = {
         "richlist": lambda: api("register/list/finance:accounts,finance:trust",
@@ -570,6 +626,7 @@ def refresh_caches(db):
     age = cache_age(db, "tokenholders")
     if age is None or age >= OWNERS_SECONDS:
         jobs["tokenholders"] = lambda: scan_owners(db)
+    start_legacy_rich(db)
     for key, job in jobs.items():
         try:
             data = job()
