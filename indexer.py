@@ -169,6 +169,10 @@ def moves_of(tx):
     for o in tx.get("outputs") or []:
         if isinstance(o, dict):
             out.append(("LEGACY", None, None, o.get("address"), None, o.get("amount"), "NXS"))
+    #an input spends an earlier output of that address
+    for i in tx.get("inputs") or []:
+        if isinstance(i, dict) and i.get("address"):
+            out.append(("LEGACY_IN", i.get("address"), None, None, None, i.get("amount"), "NXS"))
     return out
 
 
@@ -181,7 +185,8 @@ def store_block(db, b):
         if not isinstance(tx, dict):
             continue
         mv = moves_of(tx)
-        amount = sum(m[5] or 0 for m in mv)
+        #inputs are the same NXS again as the outputs
+        amount = sum(m[5] or 0 for m in mv if m[0] != "LEGACY_IN")
         ticker = next((m[6] for m in mv if m[6]), None)
         ops = ",".join(sorted({m[0] for m in mv}))
         db.execute("INSERT OR REPLACE INTO txs VALUES (?,?,?,?,?,?,?,?,?)",
@@ -271,7 +276,44 @@ def follow_tip(db):
 
 def backfill(db, budget_seconds=20):
     """Walk down from backfill_low toward genesis for a while"""
-    low = int(get_meta(db, "backfill_low", "0") or 0)
+    return walk_down(db, "backfill_low", budget_seconds)
+
+
+#legacy transactions with inputs; legacy base (coinbase) has none
+LEGACY_INPUT_TYPES = ("legacy user", "legacy trust", "legacy genesis")
+#below this nearly every block has one, above they are scattered
+LEGACY_DENSE_BELOW = 3200000
+
+
+def repair_legacy_inputs(db, budget_seconds=20):
+    """Indexes made before LEGACY_IN have no legacy inputs: store those blocks again
+    (store_block replaces rows). Scattered blocks above LEGACY_DENSE_BELOW one by one,
+    then the legacy era page by page like the backfill"""
+    start = time.time()
+    low = int(get_meta(db, "legacy_sparse_low", "0") or 0)
+    if low == 0:
+        low = (db.execute("SELECT MAX(height) FROM blocks").fetchone()[0] or 0) + 1
+    marks = ",".join("?" * len(LEGACY_INPUT_TYPES))
+    while low > LEGACY_DENSE_BELOW and time.time() - start < budget_seconds:
+        found = [r[0] for r in db.execute(
+            f"SELECT DISTINCT height FROM txs WHERE height < ? AND height >= ? AND type IN ({marks}) "
+            "ORDER BY height DESC LIMIT 20", (low, LEGACY_DENSE_BELOW, *LEGACY_INPUT_TYPES))]
+        for h in found:
+            store_block(db, get_block(h))
+        low = found[-1] if found else LEGACY_DENSE_BELOW
+        set_meta(db, "legacy_sparse_low", low)
+        db.commit()
+    if low > LEGACY_DENSE_BELOW:
+        return True
+    if get_meta(db, "legacy_inputs_low") is None:
+        set_meta(db, "legacy_inputs_low", LEGACY_DENSE_BELOW)
+        db.commit()
+    return walk_down(db, "legacy_inputs_low", budget_seconds)
+
+
+def walk_down(db, key, budget_seconds):
+    """Store blocks below the height kept in meta `key` toward genesis for a while"""
+    low = int(get_meta(db, key, "0") or 0)
     if low <= 1:
         return False
     start = time.time()
@@ -290,7 +332,7 @@ def backfill(db, budget_seconds=20):
                 store_block(db, get_block(h))
             new_low = max(1, low - PAGE)
         low = new_low
-        set_meta(db, "backfill_low", low)
+        set_meta(db, key, low)
         db.commit()
     return True
 
@@ -549,8 +591,10 @@ def main():
             if time.time() - last_cache > CACHE_SECONDS:
                 refresh_caches(db)
                 last_cache = time.time()
-            busy = backfill(db)
-            log.info("indexed down to %s", get_meta(db, "backfill_low"))
+            busy = backfill(db) or repair_legacy_inputs(db)
+            log.info("indexed down to %s, legacy inputs down to %s / %s",
+                     get_meta(db, "backfill_low"), get_meta(db, "legacy_sparse_low"),
+                     get_meta(db, "legacy_inputs_low"))
             if not busy:
                 time.sleep(FOLLOW_SECONDS)
         except Exception as e:

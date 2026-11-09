@@ -155,6 +155,29 @@ def address_rewards(addr):
                     "last30": {"count": last[0], "amount": round(last[1] or 0, 6)}})
 
 
+@bp.route("/legacy/<addr>")
+def legacy_address(addr):
+    """Received, spent and balance of a legacy (pre Tritium) address from its outputs and
+    the inputs that spent them; complete = the legacy inputs are indexed down to genesis"""
+    con = db()
+    if not con:
+        return unavailable()
+    with con:
+        got = con.execute("SELECT COUNT(*), SUM(amount), MIN(time), MAX(time) FROM moves "
+                          "WHERE to_addr = ? AND op = 'LEGACY'", (addr,)).fetchone()
+        spent = con.execute("SELECT COUNT(*), SUM(amount), MIN(time), MAX(time) FROM moves "
+                            "WHERE from_addr = ? AND op = 'LEGACY_IN'", (addr,)).fetchone()
+        low = con.execute("SELECT value FROM meta WHERE key = 'legacy_inputs_low'").fetchone()
+    received, spent_amount = got[1] or 0, spent[1] or 0
+    times = [t for t in (got[2], got[3], spent[2], spent[3]) if t]
+    return jsonify({"result": {
+        "address": addr, "outputs": got[0], "inputs": spent[0],
+        "received": round(received, 6), "spent": round(spent_amount, 6),
+        "balance": round(received - spent_amount, 6),
+        "first": min(times) if times else None, "last": max(times) if times else None,
+        "complete": bool(low) and int(low[0]) <= 1}})
+
+
 @bp.route("/register/<register_id>")
 def register_by_id(register_id):
     """Base58 address of a register given in its 64 hex form (owner of a tokenized register)"""
