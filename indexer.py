@@ -356,6 +356,10 @@ def token_holders(accounts_all):
     return out
 
 
+#key hash slots of a crypto register, TAO/Register/create.cpp
+CRYPTO_KEYS = ("auth", "lisp", "network", "sign", "verify", "cert", "app1", "app2", "app3")
+
+
 def register_row(kind, r, name=None, info=None):
     return (r.get("address"), r.get("owner"), kind, name if name is not None else r.get("name"),
             str(r["token"]) if r.get("token") is not None else None, r.get("ticker"),
@@ -379,6 +383,10 @@ def scan_owners(db):
                                                              "global": bool(n.get("global"))})))
     rows += [register_row("namespace", n, name=n.get("namespace"))
              for n in list_all("register/list/names:namespaces")]
+    #one per signature chain, info = the key hashes that are set
+    rows += [register_row("crypto", c, name="crypto", info=json.dumps(
+        {k: c[k] for k in CRYPTO_KEYS if str(c.get(k) or "").strip("0")}))
+             for c in list_all("register/list/crypto")]
     rows = [(*r, register_id(r[0])) for r in rows]
     with db:
         db.execute("DELETE FROM registers")

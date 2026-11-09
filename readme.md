@@ -31,8 +31,8 @@ blocks, transactions and value moves for the whole chain, plus cached copies of 
 register lists (rich list, trust list, global names, namespaces, tokens, assets and supply items), of the ledger
 metrics and of the on-chain market (open and filled orders of every NXS/<token> pair),
 refreshed every 10 minutes. Once an hour the indexer also scans every register list (about 80 s on mainnet) into an owner
-index, the `registers` table: who owns which account, trust account, token, asset, name and
-namespace, with each register's address also in hex (`id`). The token holders (holder count and largest accounts of every token) come from
+index, the `registers` table: who owns which account, trust account, token, asset, name,
+namespace and crypto register (key hashes), with each register's address also in hex (`id`). The token holders (holder count and largest accounts of every token) come from
 the same scan.
 
 ```
