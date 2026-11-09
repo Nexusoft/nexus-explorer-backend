@@ -55,8 +55,7 @@ def tx_rows(con, where, params, limit):
     ids = [r["txid"] for r in rows]
     moves = {}
     if ids:
-        marks = ",".join("?" * len(ids))
-        for m in con.execute(f"SELECT * FROM moves WHERE txid IN ({marks}) ORDER BY idx", ids):
+        for m in con.execute(f"SELECT * FROM moves WHERE txid IN ({marks(ids)}) ORDER BY idx", ids):
             moves.setdefault(m["txid"], []).append(dict(m))
     return [{**dict(r), "moves": moves.get(r["txid"], [])} for r in rows]
 
@@ -84,20 +83,75 @@ def transactions():
     return jsonify({"result": rows, "next": nxt})
 
 
+def marks(values):
+    return ",".join("?" * len(values))
+
+
+def moves_page(con, addrs, before, limit, ops=None, skip_ops=None):
+    """Transactions moving value to or from any of addrs below height `before`, newest first:
+    (rows, next cursor). One ordered index walk per address and side reads only limit + 1
+    rows each; one IN / OR query would read every move of a busy account before sorting"""
+    where, extra = "", ()
+    if ops:
+        where, extra = f" AND op IN ({marks(ops)})", tuple(ops)
+    elif skip_ops:
+        where, extra = f" AND op NOT IN ({marks(skip_ops)})", tuple(skip_ops)
+    found = []
+    for col in ("from_addr", "to_addr"):
+        for a in addrs:
+            found += con.execute(
+                f"SELECT txid, height FROM moves WHERE {col} = ? AND height < ?{where} "
+                "ORDER BY height DESC LIMIT ?", (a, before, *extra, limit + 1)).fetchall()
+    found = sorted(set(found), key=lambda r: r[1], reverse=True)
+    full = len(found) > limit
+    found = found[:limit]
+    #finish the last block so before=<lowest height> never skips part of a block
+    if full:
+        last = found[-1][1]
+        for col in ("from_addr", "to_addr"):
+            for a in addrs:
+                found += con.execute(
+                    f"SELECT txid, height FROM moves WHERE {col} = ? AND height = ?{where}",
+                    (a, last, *extra)).fetchall()
+    ids = list(dict.fromkeys(r[0] for r in found))
+    id_marks = marks(ids) or "''"
+    rows = tx_rows(con, f"txid IN ({id_marks})", ids, len(ids) or 1)
+    return rows, (rows[-1]["height"] if full else None)
+
+
+#operations on a register itself, for its history
+REGISTER_OPS = ("CREATE", "WRITE", "APPEND", "TRANSFER", "CLAIM")
+
+
 @bp.route("/address/<addr>/transactions")
 def address_transactions(addr):
+    """registers=1 = only operations on the register itself (created, changed, transferred)"""
     con = db()
     if not con:
         return unavailable()
     limit = arg_int("limit", 25, 1, MAX_LIMIT)
     before = arg_int("before", 2 ** 31)
+    ops = REGISTER_OPS if request.args.get("registers") == "1" else None
     with con:
-        ids = [r[0] for r in con.execute(
-            "SELECT DISTINCT txid FROM moves WHERE (from_addr = ? OR to_addr = ?) AND height < ? "
-            "ORDER BY height DESC LIMIT ?", (addr, addr, before, limit))]
-        marks = ",".join("?" * len(ids)) or "''"
-        rows = tx_rows(con, f"txid IN ({marks})", ids, limit)
-    return jsonify({"result": rows})
+        rows, nxt = moves_page(con, [addr], before, limit, ops=ops)
+    return jsonify({"result": rows, "next": nxt})
+
+
+@bp.route("/register/<register_id>")
+def register_by_id(register_id):
+    """Base58 address of a register given in its 64 hex form (owner of a tokenized register)"""
+    con = db()
+    if not con:
+        return unavailable()
+    try:
+        with con:
+            row = con.execute("SELECT address, kind, name, ticker FROM registers WHERE id = ?",
+                              (register_id.lower(),)).fetchone()
+    except sqlite3.OperationalError:
+        return unavailable()
+    if not row:
+        return jsonify({"error": {"code": 404, "message": "register not in the owner index"}}), 404
+    return jsonify({"result": dict(row)})
 
 
 OWNER_LIMIT = 1000
@@ -133,50 +187,26 @@ MAX_OWNER_ADDRESSES = 500
 
 @bp.route("/owner/<genesis>/transactions")
 def owner_transactions(genesis):
-    """Value moves to or from any account, trust account or token of one signature chain"""
+    """Value moves to or from any account, trust account or token of one signature chain;
+    transfers=1 leaves out mining and staking rewards"""
     con = db()
     if not con:
         return unavailable()
     limit = arg_int("limit", 25, 1, MAX_LIMIT)
     before = arg_int("before", 2 ** 31)
+    skip = REWARD_OPS if request.args.get("transfers") == "1" else None
     try:
         with con:
             addrs = [r[0] for r in con.execute(
-                f"SELECT address FROM registers WHERE owner = ? AND kind IN ({','.join('?' * len(VALUE_KINDS))}) "
+                f"SELECT address FROM registers WHERE owner = ? AND kind IN ({marks(VALUE_KINDS)}) "
                 "ORDER BY COALESCE(balance, 0) DESC",
                 (genesis, *VALUE_KINDS))]
             if not addrs:
                 return jsonify({"result": [], "addresses": [], "next": None})
             addrs = addrs[:MAX_OWNER_ADDRESSES]
-            #one ordered index walk per address and side reads only `limit` rows each,
-            #one IN query would read every move of a busy trust account before sorting
-            #transfers=1 leaves out mining and staking rewards
-            no_rewards = (f" AND op NOT IN ({','.join('?' * len(REWARD_OPS))})"
-                          if request.args.get("transfers") == "1" else "")
-            ops = REWARD_OPS if no_rewards else ()
-            found = []
-            for col in ("from_addr", "to_addr"):
-                for a in addrs:
-                    found += con.execute(
-                        f"SELECT txid, height FROM moves WHERE {col} = ? AND height < ?{no_rewards} "
-                        "ORDER BY height DESC LIMIT ?", (a, before, *ops, limit)).fetchall()
-            found = sorted(set(found), key=lambda r: r[1], reverse=True)
-            full = len(found) > limit
-            found = found[:limit]
-            #finish the last block so before=<lowest height> never skips part of a block
-            if full:
-                last = found[-1][1]
-                for col in ("from_addr", "to_addr"):
-                    for a in addrs:
-                        found += con.execute(
-                            f"SELECT txid, height FROM moves WHERE {col} = ? AND height = ?{no_rewards}",
-                            (a, last, *ops)).fetchall()
-            ids = list(dict.fromkeys(r[0] for r in found))
-            id_marks = ",".join("?" * len(ids)) or "''"
-            rows = tx_rows(con, f"txid IN ({id_marks})", ids, len(ids) or 1)
+            rows, nxt = moves_page(con, addrs, before, limit, skip_ops=skip)
     except sqlite3.OperationalError:
         return unavailable()
-    nxt = rows[-1]["height"] if full else None
     return jsonify({"result": rows, "addresses": addrs, "next": nxt})
 
 

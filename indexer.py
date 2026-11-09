@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS moves_to ON moves(to_addr, height);
 CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, updated INTEGER, data TEXT);
 CREATE TABLE IF NOT EXISTS registers (
   address TEXT PRIMARY KEY, owner TEXT, kind TEXT, name TEXT, token TEXT, ticker TEXT,
-  balance REAL, info TEXT, created INTEGER, modified INTEGER);
+  balance REAL, info TEXT, created INTEGER, modified INTEGER, id TEXT);
 CREATE INDEX IF NOT EXISTS registers_owner ON registers(owner);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -60,7 +60,27 @@ def connect(path=INDEX_DB):
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.executescript(SCHEMA)
+    #registers made before the id column
+    if "id" not in [c[1] for c in db.execute("PRAGMA table_info(registers)")]:
+        db.execute("ALTER TABLE registers ADD COLUMN id TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS registers_id ON registers(id)")
     return db
+
+
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def register_id(address):
+    """64 hex form of a base58 register address, as the node prints owners of tokenized
+    registers: type byte + 32 bytes whose 4 byte words come in reverse order"""
+    try:
+        n = 0
+        for ch in address:
+            n = n * 58 + BASE58.index(ch)
+        raw = n.to_bytes(37, "big")[1:33]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return b"".join(raw[i:i + 4] for i in range(28, -1, -4)).hex()
 
 
 def api(path, **params):
@@ -359,9 +379,11 @@ def scan_owners(db):
                                                              "global": bool(n.get("global"))})))
     rows += [register_row("namespace", n, name=n.get("namespace"))
              for n in list_all("register/list/names:namespaces")]
+    rows = [(*r, register_id(r[0])) for r in rows]
     with db:
         db.execute("DELETE FROM registers")
-        db.executemany("INSERT OR REPLACE INTO registers VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        db.executemany("INSERT OR REPLACE INTO registers (address, owner, kind, name, token, ticker, "
+                       "balance, info, created, modified, id) VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
     log.info("owner index: %s registers", len(rows))
     return token_holders(accounts_all)
 
