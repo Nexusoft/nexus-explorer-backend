@@ -409,6 +409,31 @@ def register_row(kind, r, name=None, info=None):
             r.get("balance"), info, r.get("created"), r.get("modified"))
 
 
+RICH_CHAINS = 500
+
+
+def rich_chains(rows):
+    """NXS per signature chain over all its accounts and trust accounts (balance + stake):
+    {chains: how many hold any NXS, top: the largest RICH_CHAINS}"""
+    chains = {}
+    for address, owner, kind, _n, token, _t, balance, info, *_ in rows:
+        if kind not in ("account", "trust") or token not in ("0", None):
+            continue
+        c = chains.setdefault(owner, {"owner": owner, "balance": 0.0, "stake": 0.0, "accounts": 0})
+        c["balance"] += balance or 0
+        if kind == "trust" and info:
+            c["stake"] += json.loads(info).get("stake") or 0
+        c["accounts"] += 1
+    held = []
+    for c in chains.values():
+        c["total"] = round(c["balance"] + c["stake"], 6)
+        c["balance"], c["stake"] = round(c["balance"], 6), round(c["stake"], 6)
+        if c["total"] > 0:
+            held.append(c)
+    held.sort(key=lambda c: c["total"], reverse=True)
+    return {"chains": len(held), "top": held[:RICH_CHAINS]}
+
+
 def scan_owners(db):
     """Fills the registers table (who owns what) and returns the token holders; about a minute"""
     accounts_all = list_all("register/list/finance:accounts")
@@ -435,6 +460,8 @@ def scan_owners(db):
         db.execute("DELETE FROM registers")
         db.executemany("INSERT OR REPLACE INTO registers (address, owner, kind, name, token, ticker, "
                        "balance, info, created, modified, id) VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)",
+                   ("richchains", int(time.time()), json.dumps(rich_chains(rows))))
     log.info("owner index: %s registers", len(rows))
     return token_holders(accounts_all)
 
