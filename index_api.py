@@ -6,7 +6,7 @@ import time
 
 from flask import Blueprint, jsonify, request
 
-from indexer import REWARD_OPS, api
+from indexer import REWARD_OPS, TX_KINDS, api
 
 INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
 MAX_LIMIT = 100
@@ -71,6 +71,11 @@ def transactions():
     where, params = "height < ?", [before]
     if request.args.get("transfers") == "1":
         where += " AND is_reward = 0 AND type != 'unreadable'"
+    #kind=payment|token|register|ownership|legacy|reward|other, index txs_kind
+    kind = request.args.get("kind")
+    if kind in TX_KINDS:
+        where += " AND kind = ?"
+        params.append(kind)
     with con:
         rows = tx_rows(con, where, params, limit)
         #finish the last block so before=<lowest height> never skips part of a block

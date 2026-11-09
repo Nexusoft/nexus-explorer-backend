@@ -43,7 +43,7 @@ It follows the tip every 10 seconds and backfills older blocks in the background
 (a full mainnet backfill takes about an hour). `app.py` serves the index read-only:
 
 - `GET /explorer/status` - indexed height range and cache times
-- `GET /explorer/transactions?limit=25&transfers=1&before=<height>` - newest first, `next` = cursor for the following page
+- `GET /explorer/transactions?limit=25&transfers=1&kind=<kind>&before=<height>` - newest first, `next` = cursor for the following page; `kind` = payment, token, register (created or changed), ownership (transfer or claim), legacy, reward or other, one per transaction, stored by the indexer
 - `GET /explorer/address/<address>/transactions?limit=25&registers=1&before=<height>` - newest first, `registers=1` = only operations on the register itself (create, write, append, transfer, claim: its history), `next` = cursor
 - `GET /explorer/address/<address>/rewards` - staking rewards of a trust account per UTC month (`[month, rewards, NXS]`) and `last30` = count and NXS of the last 30 days
 - `GET /explorer/legacy/<address>` - a legacy (pre Tritium) address: received (its outputs), spent (the inputs that spent them), balance, first and last activity; `complete` = legacy inputs are indexed down to genesis

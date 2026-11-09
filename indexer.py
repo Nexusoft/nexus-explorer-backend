@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS blocks (
   mint REAL, txcount INTEGER, size INTEGER);
 CREATE TABLE IF NOT EXISTS txs (
   txid TEXT PRIMARY KEY, height INTEGER, time INTEGER, type TEXT,
-  contracts INTEGER, is_reward INTEGER, amount REAL, ticker TEXT, ops TEXT);
+  contracts INTEGER, is_reward INTEGER, amount REAL, ticker TEXT, ops TEXT, kind TEXT);
 CREATE INDEX IF NOT EXISTS txs_height ON txs(height);
 CREATE INDEX IF NOT EXISTS txs_transfer ON txs(is_reward, height);
 CREATE TABLE IF NOT EXISTS moves (
@@ -71,6 +71,12 @@ def connect(path=INDEX_DB):
     if "id" not in [c[1] for c in db.execute("PRAGMA table_info(registers)")]:
         db.execute("ALTER TABLE registers ADD COLUMN id TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS registers_id ON registers(id)")
+    #txs made before the kind column
+    if "kind" not in [c[1] for c in db.execute("PRAGMA table_info(txs)")]:
+        db.execute("ALTER TABLE txs ADD COLUMN kind TEXT")
+    if get_meta(db, "tx_kinds_filled") is None:
+        fill_tx_kinds(db)
+    db.execute("CREATE INDEX IF NOT EXISTS txs_kind ON txs(kind, height)")
     if get_meta(db, "legacy_rewards_fixed") is None:
         fix_legacy_rewards(db)
     if get_meta(db, "migrate_moves_fixed") is None:
@@ -177,6 +183,41 @@ def moves_of(tx):
     return out
 
 
+#transaction kinds the explorer filters by, first match wins
+TX_KINDS = ("reward", "legacy", "ownership", "register", "token", "payment", "other")
+
+
+def tx_kind(tx_type, reward, ops, ticker):
+    """One kind per transaction from its stored fields (also used to fill old rows)"""
+    ops = set((ops or "").split(","))
+    if reward:
+        return "reward"
+    if (tx_type or "").startswith("legacy"):
+        return "legacy"
+    if ops & {"TRANSFER", "CLAIM"}:
+        return "ownership"
+    if ops & {"CREATE", "WRITE", "APPEND"}:
+        return "register"
+    if ticker and ticker != "NXS":
+        return "token"
+    if ops & {"DEBIT", "CREDIT", "LEGACY"}:
+        return "payment"
+    return "other"
+
+
+def fill_tx_kinds(db, step=200000):
+    """Indexes made before the kind column: classify every stored transaction once"""
+    top = db.execute("SELECT MAX(height) FROM txs").fetchone()[0] or 0
+    for low in range(0, top + 1, step):
+        rows = db.execute("SELECT txid, type, is_reward, ops, ticker FROM txs "
+                          "WHERE height >= ? AND height < ?", (low, low + step)).fetchall()
+        db.executemany("UPDATE txs SET kind = ? WHERE txid = ?",
+                       [(tx_kind(t, r, o, k), txid) for txid, t, r, o, k in rows])
+        db.commit()
+    set_meta(db, "tx_kinds_filled", 1)
+    db.commit()
+
+
 def store_block(db, b):
     txs = b.get("tx") or []
     db.execute("INSERT OR REPLACE INTO blocks VALUES (?,?,?,?,?,?,?)",
@@ -190,9 +231,12 @@ def store_block(db, b):
         amount = sum(m[5] or 0 for m in mv if m[0] != "LEGACY_IN")
         ticker = next((m[6] for m in mv if m[6]), None)
         ops = ",".join(sorted({m[0] for m in mv}))
-        db.execute("INSERT OR REPLACE INTO txs VALUES (?,?,?,?,?,?,?,?,?)",
+        reward = int(is_reward(tx))
+        db.execute("INSERT OR REPLACE INTO txs (txid, height, time, type, contracts, is_reward, "
+                   "amount, ticker, ops, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (tx["txid"], b["height"], tx.get("timestamp"), tx.get("type"),
-                    len(tx.get("contracts") or []), int(is_reward(tx)), amount, ticker, ops))
+                    len(tx.get("contracts") or []), reward, amount, ticker, ops,
+                    tx_kind(tx.get("type"), reward, ops, ticker)))
         db.executemany("INSERT OR REPLACE INTO moves VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        [(tx["txid"], i, b["height"], tx.get("timestamp"), *m) for i, m in enumerate(mv)])
 
