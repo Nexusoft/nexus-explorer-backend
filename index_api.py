@@ -6,7 +6,7 @@ import time
 
 from flask import Blueprint, jsonify, request
 
-from indexer import REWARD_OPS
+from indexer import REWARD_OPS, api
 
 INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
 MAX_LIMIT = 100
@@ -291,5 +291,30 @@ def cached(key):
     with con:
         row = con.execute("SELECT updated, data FROM cache WHERE key = ?", (key,)).fetchone()
     if not row:
+        #a cache the indexer makes later (legacyrich waits for the legacy inputs) is not an error
+        if key in KNOWN_CACHES:
+            return jsonify({"result": None, "updated": None})
         return jsonify({"error": {"code": 404, "message": f"no cache for {key}"}}), 404
     return jsonify({"result": json.loads(row["data"]), "updated": row["updated"]})
+
+
+KNOWN_CACHES = {"richlist", "trustlist", "globalnames", "namespaces", "tokens", "ledgermetrics",
+                "markets", "assets", "tokenholders", "daily", "richchains", "legacyrich"}
+USER_ACCOUNTS = (("finance/get/account", "default"), ("finance/get/trust", "trust"))
+
+
+@bp.route("/user/<username>")
+def find_user(username):
+    """Signature chain of a username: the chain keeps no plain usernames, but every profile
+    has username:default and username:trust. Unknown names answer null, not a node error"""
+    name = username.strip()
+    if not name or ":" in name or len(name) > SEARCH_MAX_LEN:
+        return jsonify({"result": None})
+    for path, account in USER_ACCOUNTS:
+        try:
+            owner = (api(path, name=f"{name}:{account}") or {}).get("owner")
+        except Exception:
+            owner = None
+        if owner:
+            return jsonify({"result": {"username": name, "genesis": owner}})
+    return jsonify({"result": None})
