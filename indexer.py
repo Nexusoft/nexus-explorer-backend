@@ -72,7 +72,25 @@ def connect(path=INDEX_DB):
     db.execute("CREATE INDEX IF NOT EXISTS registers_id ON registers(id)")
     if get_meta(db, "legacy_rewards_fixed") is None:
         fix_legacy_rewards(db)
+    if get_meta(db, "migrate_moves_fixed") is None:
+        try:
+            fix_migrate_moves(db)
+        except UNREADABLE as e:
+            #node not reachable, the next start tries again
+            log.warning("MIGRATE fix postponed: %s", str(e).split(" for url:")[0])
     return db
+
+
+def fix_migrate_moves(db):
+    """Indexes made before MIGRATE was mapped stored its moves without the trust account"""
+    for (txid,) in db.execute("SELECT txid FROM txs WHERE ops LIKE '%MIGRATE%'").fetchall():
+        tx = api("ledger/get/transaction", txid=txid, verbose="summary")
+        for i, c in enumerate(tx.get("contracts") or []):
+            if c.get("OP") == "MIGRATE":
+                db.execute("UPDATE moves SET to_addr = ?, to_name = ? WHERE txid = ? AND idx = ?",
+                           (c.get("address"), c.get("name"), txid, i))
+    set_meta(db, "migrate_moves_fixed", 1)
+    db.commit()
 
 
 def fix_legacy_rewards(db, step=100000):
@@ -139,7 +157,8 @@ def moves_of(tx):
         op = c.get("OP", "")
         f, fn = party(c.get("from"))
         t, tn = party(c.get("to"))
-        if op in ("TRUST", "GENESIS", "STAKE", "UNSTAKE"):
+        #MIGRATE moves a legacy trust key's output into its Tritium trust account
+        if op in ("TRUST", "GENESIS", "STAKE", "UNSTAKE", "MIGRATE"):
             t, tn = c.get("address"), c.get("name")
         elif op == "COINBASE":
             t = c.get("genesis")
