@@ -39,8 +39,31 @@ the same scan, and so does `richchains`: NXS per signature chain over all its ac
 python indexer.py
 ```
 
-It follows the tip every 10 seconds and backfills older blocks in the background
-(a full mainnet backfill takes about an hour). `app.py` serves the index read-only:
+It follows the tip every 10 seconds and backfills older blocks in the background, newest first, so
+recent pages work within minutes. A full mainnet backfill takes many hours (about 320,000 blocks an
+hour was measured on a node that was busy with another indexer at the same time), and the
+finished index is about 16 GB. The indexer reads the node API at `SERVER_URL` from `local.env`, like
+`app.py` (default `http://127.0.0.1:8080`, an API login goes in the URL: `http://user:password@host:8080`).
+As a systemd service:
+
+```
+[Unit]
+Description=Nexus explorer block indexer
+After=nexus-node.service
+
+[Service]
+User=nexus
+WorkingDirectory=/home/nexus/nexus-explorer-backend
+ExecStart=/home/nexus/nexus-explorer-backend/.venv/bin/python indexer.py
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`app.py` serves the index read-only (same `INDEX_DB`):
 
 - `GET /explorer/status` - indexed height range and cache times; `result: null` when there is no index (the other routes answer 503)
 - `GET /explorer/transactions?limit=25&transfers=1&kind=<kind>&before=<height>` - newest first, `next` = cursor for the following page; `kind` = payment, token, register (created or changed), ownership (transfer or claim), legacy, reward or other, one per transaction, stored by the indexer

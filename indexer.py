@@ -65,14 +65,19 @@ CREATE TABLE IF NOT EXISTS daily (
 
 #one time fixes of older indexes, and legacy inputs stored by the backfill itself
 NEW_INDEX_DONE = ("tx_kinds_filled", "legacy_rewards_fixed", "migrate_moves_fixed",
-                  "unnamed_token_kinds_fixed", "mixed_token_kinds_fixed", "legacy_inputs_from_start")
+                  "unnamed_token_kinds_fixed", "mixed_token_kinds_fixed", "legacy_tritium_inputs",
+                  "legacy_inputs_from_start")
 
 
 def legacy_inputs_low(db):
     """Height down to which legacy inputs are stored: the repair of an old index, or the
     backfill of an index that stored them from the start"""
-    key = "backfill_low" if get_meta(db, "legacy_inputs_from_start") else "legacy_inputs_low"
-    return int(get_meta(db, key, str(2 ** 31)) or 2 ** 31)
+    if get_meta(db, "legacy_inputs_from_start"):
+        return int(get_meta(db, "backfill_low", str(2 ** 31)) or 2 ** 31)
+    #the block by block pass above LEGACY_DENSE_BELOW runs first and may run again
+    if int(get_meta(db, "legacy_sparse_low", "0") or 0) != LEGACY_DENSE_BELOW:
+        return 2 ** 31
+    return int(get_meta(db, "legacy_inputs_low", str(2 ** 31)) or 2 ** 31)
 
 
 def connect(path=INDEX_DB):
@@ -113,6 +118,13 @@ def connect(path=INDEX_DB):
             log.warning("token kind fix postponed: %s", str(e).split(" for url:")[0])
     if get_meta(db, "mixed_token_kinds_fixed") is None:
         fix_mixed_token_kinds(db)
+    #inputs spending what a Tritium account sent to a legacy address were not stored: read
+    #the legacy blocks above LEGACY_DENSE_BELOW again, and drop the balances made without them
+    if get_meta(db, "legacy_tritium_inputs") is None:
+        set_meta(db, "legacy_sparse_low", 0)
+        db.execute("DELETE FROM cache WHERE key = 'legacyrich'")
+        set_meta(db, "legacy_tritium_inputs", 1)
+        db.commit()
     return db
 
 
@@ -227,10 +239,14 @@ def moves_of(tx):
     for o in tx.get("outputs") or []:
         if isinstance(o, dict):
             out.append(("LEGACY", None, None, o.get("address"), None, o.get("amount"), "NXS"))
-    #an input spends an earlier output of that address
+    #an input spends an earlier output of that address; an output a Tritium account sent
+    #(LEGACY contract) comes as that contract, the spent address is its "to"
     for i in tx.get("inputs") or []:
-        if isinstance(i, dict) and i.get("address"):
-            out.append(("LEGACY_IN", i.get("address"), None, None, None, i.get("amount"), "NXS"))
+        if not isinstance(i, dict):
+            continue
+        spent = i.get("address") or party(i.get("to"))[0]
+        if spent:
+            out.append(("LEGACY_IN", spent, None, None, None, i.get("amount"), "NXS"))
     return out
 
 
@@ -387,6 +403,19 @@ LEGACY_INPUT_TYPES = ("legacy user", "legacy trust", "legacy genesis")
 LEGACY_DENSE_BELOW = 3200000
 
 
+def inputs_short(db, height):
+    """true when a legacy transaction of the block has fewer stored inputs than outputs
+    (inputs always cover the outputs plus the fee), so the block must be read again"""
+    marks = ",".join("?" * len(LEGACY_INPUT_TYPES))
+    for (txid,) in db.execute(f"SELECT txid FROM txs WHERE height = ? AND type IN ({marks})",
+                              (height, *LEGACY_INPUT_TYPES)).fetchall():
+        sums = dict(db.execute("SELECT op, SUM(amount) FROM moves WHERE txid = ? "
+                               "AND op IN ('LEGACY', 'LEGACY_IN') GROUP BY op", (txid,)).fetchall())
+        if (sums.get("LEGACY_IN") or 0) < (sums.get("LEGACY") or 0) - 1e-6:
+            return True
+    return False
+
+
 def repair_legacy_inputs(db, budget_seconds=20):
     """Indexes made before LEGACY_IN have no legacy inputs: store those blocks again
     (store_block replaces rows). Scattered blocks above LEGACY_DENSE_BELOW one by one,
@@ -403,7 +432,8 @@ def repair_legacy_inputs(db, budget_seconds=20):
             f"SELECT DISTINCT height FROM txs WHERE height < ? AND height >= ? AND type IN ({marks}) "
             "ORDER BY height DESC LIMIT 20", (low, LEGACY_DENSE_BELOW, *LEGACY_INPUT_TYPES))]
         for h in found:
-            store_block(db, get_block(h))
+            if inputs_short(db, h):
+                store_block(db, get_block(h))
         low = found[-1] if found else LEGACY_DENSE_BELOW
         set_meta(db, "legacy_sparse_low", low)
         db.commit()
@@ -666,15 +696,15 @@ def legacy_rich():
     over moves, minutes, so it runs on its own read only connection"""
     con = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True, timeout=30)
     bal = {}
-    for addr, amount in con.execute(
-            "SELECT to_addr, SUM(amount) FROM moves WHERE op = 'LEGACY' GROUP BY to_addr"):
-        #outputs to a Tritium account (8...) are claimed into it, not kept at an address
-        if addr and not addr.startswith("8"):
-            bal[addr] = bal.get(addr, 0.0) + (amount or 0)
-    for addr, amount in con.execute(
-            "SELECT from_addr, SUM(amount) FROM moves WHERE op = 'LEGACY_IN' GROUP BY from_addr"):
-        if addr:
-            bal[addr] = bal.get(addr, 0.0) - (amount or 0)
+    #one sequential read summed here: GROUP BY in SQL sorted the whole table into temp files
+    for op, frm, to, amount in con.execute(
+            "SELECT op, from_addr, to_addr, amount FROM moves WHERE op IN ('LEGACY', 'LEGACY_IN')"):
+        if op == "LEGACY":
+            #outputs to a Tritium account (8...) are claimed into it, not kept at an address
+            if to and not to.startswith("8"):
+                bal[to] = bal.get(to, 0.0) + (amount or 0)
+        elif frm:
+            bal[frm] = bal.get(frm, 0.0) - (amount or 0)
     con.close()
     held = sorted(((a, round(b, 6)) for a, b in bal.items() if b > 1e-6),
                   key=lambda x: x[1], reverse=True)
@@ -813,8 +843,9 @@ def main():
                 refresh_caches(db)
                 last_cache = time.time()
             busy = backfill(db) or repair_legacy_inputs(db)
-            log.info("indexed down to %s, legacy inputs down to %s",
-                     get_meta(db, "backfill_low"), legacy_inputs_low(db))
+            log.info("indexed down to %s, legacy inputs down to %s (block by block pass at %s)",
+                     get_meta(db, "backfill_low"), legacy_inputs_low(db),
+                     get_meta(db, "legacy_sparse_low"))
             if not busy:
                 time.sleep(FOLLOW_SECONDS)
         except Exception as e:
