@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS daily (
 #one time fixes of older indexes, and legacy inputs stored by the backfill itself
 NEW_INDEX_DONE = ("tx_kinds_filled", "legacy_rewards_fixed", "migrate_moves_fixed",
                   "unnamed_token_kinds_fixed", "mixed_token_kinds_fixed", "legacy_tritium_inputs",
+                  "tritium_inputs_low",
                   "legacy_inputs_from_start")
 
 
@@ -76,6 +77,8 @@ def legacy_inputs_low(db):
         return int(get_meta(db, "backfill_low", str(2 ** 31)) or 2 ** 31)
     #the block by block pass above LEGACY_DENSE_BELOW runs first and may run again
     if int(get_meta(db, "legacy_sparse_low", "0") or 0) != LEGACY_DENSE_BELOW:
+        return 2 ** 31
+    if int(get_meta(db, "tritium_inputs_low", str(LEGACY_DENSE_BELOW)) or 0) > TRITIUM_FROM:
         return 2 ** 31
     return int(get_meta(db, "legacy_inputs_low", str(2 ** 31)) or 2 ** 31)
 
@@ -124,6 +127,11 @@ def connect(path=INDEX_DB):
         set_meta(db, "legacy_sparse_low", 0)
         db.execute("DELETE FROM cache WHERE key = 'legacyrich'")
         set_meta(db, "legacy_tritium_inputs", 1)
+        db.commit()
+    #same below LEGACY_DENSE_BELOW down to Tritium (repair_tritium_funded_inputs)
+    if get_meta(db, "tritium_inputs_low") is None:
+        set_meta(db, "tritium_inputs_low", LEGACY_DENSE_BELOW)
+        db.execute("DELETE FROM cache WHERE key = 'legacyrich'")
         db.commit()
     return db
 
@@ -403,17 +411,45 @@ LEGACY_INPUT_TYPES = ("legacy user", "legacy trust", "legacy genesis")
 LEGACY_DENSE_BELOW = 3200000
 
 
+#first block of Tritium on mainnet: from here a legacy input can spend what an account sent
+TRITIUM_FROM = 2944207
+
+
 def inputs_short(db, height):
-    """true when a legacy transaction of the block has fewer stored inputs than outputs
-    (inputs always cover the outputs plus the fee), so the block must be read again"""
+    """true when a legacy payment of the block has fewer stored inputs than outputs (inputs
+    cover the outputs plus the fee), or a legacy stake has none (its outputs add the reward),
+    so the block must be read again"""
     marks = ",".join("?" * len(LEGACY_INPUT_TYPES))
-    for (txid,) in db.execute(f"SELECT txid FROM txs WHERE height = ? AND type IN ({marks})",
-                              (height, *LEGACY_INPUT_TYPES)).fetchall():
+    for txid, tx_type in db.execute(f"SELECT txid, type FROM txs WHERE height = ? AND type IN ({marks})",
+                                    (height, *LEGACY_INPUT_TYPES)).fetchall():
         sums = dict(db.execute("SELECT op, SUM(amount) FROM moves WHERE txid = ? "
                                "AND op IN ('LEGACY', 'LEGACY_IN') GROUP BY op", (txid,)).fetchall())
-        if (sums.get("LEGACY_IN") or 0) < (sums.get("LEGACY") or 0) - 1e-6:
+        got = sums.get("LEGACY_IN")
+        if got is None or (tx_type == "legacy user" and got < (sums.get("LEGACY") or 0) - 1e-6):
             return True
     return False
+
+
+def repair_tritium_funded_inputs(db, budget_seconds=20):
+    """Legacy payments between Tritium and LEGACY_DENSE_BELOW were stored by the page by page
+    repair before moves_of() read inputs a Tritium account funded: read those blocks again"""
+    if get_meta(db, "legacy_inputs_from_start"):
+        return False
+    low = int(get_meta(db, "tritium_inputs_low", str(LEGACY_DENSE_BELOW)) or 0)
+    if low <= TRITIUM_FROM:
+        return False
+    start = time.time()
+    while low > TRITIUM_FROM and time.time() - start < budget_seconds:
+        found = [r[0] for r in db.execute(
+            "SELECT DISTINCT height FROM txs WHERE height < ? AND height >= ? AND type = 'legacy user' "
+            "ORDER BY height DESC LIMIT 50", (low, TRITIUM_FROM))]
+        for h in found:
+            if inputs_short(db, h):
+                store_block(db, get_block(h))
+        low = found[-1] if found else TRITIUM_FROM
+        set_meta(db, "tritium_inputs_low", low)
+        db.commit()
+    return True
 
 
 def repair_legacy_inputs(db, budget_seconds=20):
@@ -842,10 +878,10 @@ def main():
             if time.time() - last_cache > CACHE_SECONDS:
                 refresh_caches(db)
                 last_cache = time.time()
-            busy = backfill(db) or repair_legacy_inputs(db)
-            log.info("indexed down to %s, legacy inputs down to %s (block by block pass at %s)",
+            busy = backfill(db) or repair_legacy_inputs(db) or repair_tritium_funded_inputs(db)
+            log.info("indexed down to %s, legacy inputs down to %s (block by block passes at %s and %s)",
                      get_meta(db, "backfill_low"), legacy_inputs_low(db),
-                     get_meta(db, "legacy_sparse_low"))
+                     get_meta(db, "legacy_sparse_low"), get_meta(db, "tritium_inputs_low"))
             if not busy:
                 time.sleep(FOLLOW_SECONDS)
         except Exception as e:
