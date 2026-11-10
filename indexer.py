@@ -1,0 +1,894 @@
+"""Optional block indexer for the explorer.
+
+Keeps a SQLite copy of blocks, transactions and value moves so the explorer can
+list transfers across the whole chain, and caches the slow register lists
+(rich list, trust list, global names). Runs next to the node:
+
+    python indexer.py            # forever: follow the tip, backfill, refresh caches
+
+The Flask app (app.py) serves the data under /explorer/... when INDEX_DB exists.
+"""
+import heapq
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv("local.env")
+
+SERVER_URL = os.getenv("SERVER_URL", "http://127.0.0.1:8080").rstrip("/")
+INDEX_DB = os.getenv("INDEX_DB", "explorer_index.sqlite")
+PAGE = 100
+FOLLOW_SECONDS = 10
+CACHE_SECONDS = 600
+REORG_DEPTH = 20
+REWARD_OPS = ("COINBASE", "TRUST", "GENESIS")
+#pre Tritium mining, staking and first staking rewards carry no contracts, only a type
+LEGACY_REWARD_TYPES = ("legacy base", "legacy trust", "legacy genesis")
+#node answers 500 or drops the connection on transactions it cannot decode
+UNREADABLE = (requests.HTTPError, requests.ConnectionError)
+
+log = logging.getLogger("indexer")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS blocks (
+  height INTEGER PRIMARY KEY, hash TEXT, time INTEGER, channel INTEGER,
+  mint REAL, txcount INTEGER, size INTEGER);
+CREATE TABLE IF NOT EXISTS txs (
+  txid TEXT PRIMARY KEY, height INTEGER, time INTEGER, type TEXT,
+  contracts INTEGER, is_reward INTEGER, amount REAL, ticker TEXT, ops TEXT, kind TEXT);
+CREATE INDEX IF NOT EXISTS txs_height ON txs(height);
+CREATE INDEX IF NOT EXISTS txs_transfer ON txs(is_reward, height);
+CREATE TABLE IF NOT EXISTS moves (
+  txid TEXT, idx INTEGER, height INTEGER, time INTEGER, op TEXT,
+  from_addr TEXT, from_name TEXT, to_addr TEXT, to_name TEXT,
+  amount REAL, ticker TEXT, PRIMARY KEY (txid, idx));
+CREATE INDEX IF NOT EXISTS moves_from ON moves(from_addr, height);
+CREATE INDEX IF NOT EXISTS moves_to ON moves(to_addr, height);
+CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, updated INTEGER, data TEXT);
+CREATE TABLE IF NOT EXISTS registers (
+  address TEXT PRIMARY KEY, owner TEXT, kind TEXT, name TEXT, token TEXT, ticker TEXT,
+  balance REAL, info TEXT, created INTEGER, modified INTEGER, id TEXT);
+CREATE INDEX IF NOT EXISTS registers_owner ON registers(owner);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS daily (
+  day INTEGER PRIMARY KEY, first_height INTEGER,
+  blocks_stake INTEGER, blocks_prime INTEGER, blocks_hash INTEGER,
+  mint_stake REAL, mint_prime REAL, mint_hash REAL, txs INTEGER, transfers INTEGER);
+"""
+
+
+#one time fixes of older indexes, and legacy inputs stored by the backfill itself
+NEW_INDEX_DONE = ("tx_kinds_filled", "legacy_rewards_fixed", "migrate_moves_fixed",
+                  "unnamed_token_kinds_fixed", "mixed_token_kinds_fixed", "legacy_tritium_inputs",
+                  "tritium_inputs_low",
+                  "legacy_inputs_from_start")
+
+
+def legacy_inputs_low(db):
+    """Height down to which legacy inputs are stored: the repair of an old index, or the
+    backfill of an index that stored them from the start"""
+    if get_meta(db, "legacy_inputs_from_start"):
+        return int(get_meta(db, "backfill_low", str(2 ** 31)) or 2 ** 31)
+    #the block by block pass above LEGACY_DENSE_BELOW runs first and may run again
+    if int(get_meta(db, "legacy_sparse_low", "0") or 0) != LEGACY_DENSE_BELOW:
+        return 2 ** 31
+    if int(get_meta(db, "tritium_inputs_low", str(LEGACY_DENSE_BELOW)) or 0) > TRITIUM_FROM:
+        return 2 ** 31
+    return int(get_meta(db, "legacy_inputs_low", str(2 ** 31)) or 2 ** 31)
+
+
+def connect(path=INDEX_DB):
+    db = sqlite3.connect(path, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.executescript(SCHEMA)
+    #a new index stores everything the one time fixes below repair in old ones
+    if db.execute("SELECT COUNT(*) FROM meta").fetchone()[0] == 0 and \
+            db.execute("SELECT COUNT(*) FROM blocks").fetchone()[0] == 0:
+        for key in NEW_INDEX_DONE:
+            set_meta(db, key, 1)
+        db.commit()
+    #registers made before the id column
+    if "id" not in [c[1] for c in db.execute("PRAGMA table_info(registers)")]:
+        db.execute("ALTER TABLE registers ADD COLUMN id TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS registers_id ON registers(id)")
+    #txs made before the kind column
+    if "kind" not in [c[1] for c in db.execute("PRAGMA table_info(txs)")]:
+        db.execute("ALTER TABLE txs ADD COLUMN kind TEXT")
+    if get_meta(db, "tx_kinds_filled") is None:
+        fill_tx_kinds(db)
+    db.execute("CREATE INDEX IF NOT EXISTS txs_kind ON txs(kind, height)")
+    #covering index for largest_payments
+    db.execute("CREATE INDEX IF NOT EXISTS txs_amount ON txs(kind, amount, time, ops)")
+    if get_meta(db, "legacy_rewards_fixed") is None:
+        fix_legacy_rewards(db)
+    if get_meta(db, "migrate_moves_fixed") is None:
+        try:
+            fix_migrate_moves(db)
+        except UNREADABLE as e:
+            #node not reachable, the next start tries again
+            log.warning("MIGRATE fix postponed: %s", str(e).split(" for url:")[0])
+    if get_meta(db, "unnamed_token_kinds_fixed") is None:
+        try:
+            fix_unnamed_token_kinds(db)
+        except UNREADABLE as e:
+            log.warning("token kind fix postponed: %s", str(e).split(" for url:")[0])
+    if get_meta(db, "mixed_token_kinds_fixed") is None:
+        fix_mixed_token_kinds(db)
+    #inputs spending what a Tritium account sent to a legacy address were not stored: read
+    #the legacy blocks above LEGACY_DENSE_BELOW again, and drop the balances made without them
+    if get_meta(db, "legacy_tritium_inputs") is None:
+        set_meta(db, "legacy_sparse_low", 0)
+        db.execute("DELETE FROM cache WHERE key = 'legacyrich'")
+        set_meta(db, "legacy_tritium_inputs", 1)
+        db.commit()
+    #same below LEGACY_DENSE_BELOW down to Tritium (repair_tritium_funded_inputs)
+    if get_meta(db, "tritium_inputs_low") is None:
+        set_meta(db, "tritium_inputs_low", LEGACY_DENSE_BELOW)
+        db.execute("DELETE FROM cache WHERE key = 'legacyrich'")
+        db.commit()
+    return db
+
+
+def fix_migrate_moves(db):
+    """Indexes made before MIGRATE was mapped stored its moves without the trust account"""
+    for (txid,) in db.execute("SELECT txid FROM txs WHERE ops LIKE '%MIGRATE%'").fetchall():
+        tx = api("ledger/get/transaction", txid=txid, verbose="summary")
+        for i, c in enumerate(tx.get("contracts") or []):
+            if c.get("OP") == "MIGRATE":
+                db.execute("UPDATE moves SET to_addr = ?, to_name = ? WHERE txid = ? AND idx = ?",
+                           (c.get("address"), c.get("name"), txid, i))
+    set_meta(db, "migrate_moves_fixed", 1)
+    db.commit()
+
+
+def fix_unnamed_token_kinds(db):
+    """Kinds filled before moves_token(): moves of tokens without a ticker were payments"""
+    for (txid,) in db.execute("SELECT txid FROM txs WHERE kind = 'payment' AND ticker IS NULL").fetchall():
+        if moves_token(api("ledger/get/transaction", txid=txid)):
+            db.execute("UPDATE txs SET kind = 'token' WHERE txid = ?", (txid,))
+    set_meta(db, "unnamed_token_kinds_fixed", 1)
+    db.commit()
+
+
+def fix_mixed_token_kinds(db):
+    """Kinds filled before moves_token() looked at the first move's ticker only: a payment
+    with NXS first and a token after it is a token transaction"""
+    ids = [r[0] for r in db.execute(
+        "SELECT txid FROM txs WHERE kind = 'payment' AND ticker = 'NXS' AND contracts > 1")]
+    mixed = [(t,) for t in ids if db.execute(
+        "SELECT 1 FROM moves WHERE txid = ? AND ticker IS NOT NULL AND ticker != 'NXS' LIMIT 1",
+        (t,)).fetchone()]
+    db.executemany("UPDATE txs SET kind = 'token' WHERE txid = ?", mixed)
+    set_meta(db, "mixed_token_kinds_fixed", 1)
+    db.commit()
+    return len(mixed)
+
+
+def fix_legacy_rewards(db, step=100000):
+    """Indexes made before LEGACY_REWARD_TYPES stored legacy rewards as transfers"""
+    marks = ",".join("?" * len(LEGACY_REWARD_TYPES))
+    top = db.execute("SELECT MAX(height) FROM txs").fetchone()[0] or 0
+    for low in range(0, top + 1, step):
+        db.execute(f"UPDATE txs SET is_reward = 1 WHERE height >= ? AND height < ? AND is_reward = 0 "
+                   f"AND type IN ({marks})", (low, low + step, *LEGACY_REWARD_TYPES))
+        db.commit()
+    #the per day transfer counts came from the same flag
+    db.execute("DELETE FROM daily")
+    set_meta(db, "legacy_rewards_fixed", 1)
+    db.commit()
+
+
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def register_id(address):
+    """64 hex form of a base58 register address, as the node prints owners of tokenized
+    registers: type byte + 32 bytes whose 4 byte words come in reverse order"""
+    try:
+        n = 0
+        for ch in address:
+            n = n * 58 + BASE58.index(ch)
+        raw = n.to_bytes(37, "big")[1:33]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return b"".join(raw[i:i + 4] for i in range(28, -1, -4)).hex()
+
+
+def api(path, **params):
+    r = requests.get(f"{SERVER_URL}/{path}", params=params, timeout=120)
+    r.raise_for_status()
+    return r.json()["result"]
+
+
+def party(p):
+    if not p:
+        return None, None
+    if isinstance(p, str):
+        return p, None
+    return p.get("address"), p.get("name")
+
+
+def reward_contract(c):
+    return c.get("OP") in REWARD_OPS or (c.get("OP") == "CREDIT" and c.get("for") == "COINBASE")
+
+
+def is_reward(tx):
+    """only rewards (a fee next to a reward claim does not make it a transfer)"""
+    if tx.get("type") in LEGACY_REWARD_TYPES:
+        return True
+    contracts = tx.get("contracts") or []
+    return any(reward_contract(c) for c in contracts) and all(
+        reward_contract(c) or c.get("OP") == "FEE" for c in contracts)
+
+
+def moves_of(tx):
+    """(op, from, from_name, to, to_name, amount, ticker) per contract or legacy output"""
+    out = []
+    for c in tx.get("contracts") or []:
+        op = c.get("OP", "")
+        f, fn = party(c.get("from"))
+        t, tn = party(c.get("to"))
+        #MIGRATE moves a legacy trust key's output into its Tritium trust account
+        if op in ("TRUST", "GENESIS", "STAKE", "UNSTAKE", "MIGRATE"):
+            t, tn = c.get("address"), c.get("name")
+        elif op == "COINBASE":
+            t = c.get("genesis")
+        elif op in ("CREATE", "WRITE", "APPEND", "TRANSFER", "CLAIM") and c.get("address"):
+            t, tn = c.get("address"), c.get("name")
+        out.append((op, f, fn, t, tn, c.get("amount"), c.get("ticker")))
+    #legacy (pre Tritium) transactions carry inputs / outputs instead of contracts
+    for o in tx.get("outputs") or []:
+        if isinstance(o, dict):
+            out.append(("LEGACY", None, None, o.get("address"), None, o.get("amount"), "NXS"))
+    #an input spends an earlier output of that address; an output a Tritium account sent
+    #(LEGACY contract) comes as that contract, the spent address is its "to"
+    for i in tx.get("inputs") or []:
+        if not isinstance(i, dict):
+            continue
+        spent = i.get("address") or party(i.get("to"))[0]
+        if spent:
+            out.append(("LEGACY_IN", spent, None, None, None, i.get("amount"), "NXS"))
+    return out
+
+
+#transaction kinds the explorer filters by, first match wins
+TX_KINDS = ("reward", "legacy", "ownership", "register", "token", "payment", "other")
+
+
+def moves_token(tx):
+    """true when a contract moves a token other than NXS (token "0"); unnamed tokens have no ticker"""
+    return any(isinstance(c, dict) and (c.get("token") or "0") != "0"
+               for c in tx.get("contracts") or [])
+
+
+def tx_kind(tx_type, reward, ops, ticker, token=False):
+    """One kind per transaction from its stored fields (also used to fill old rows)"""
+    ops = set((ops or "").split(","))
+    if reward:
+        return "reward"
+    if (tx_type or "").startswith("legacy"):
+        return "legacy"
+    if ops & {"TRANSFER", "CLAIM"}:
+        return "ownership"
+    if ops & {"CREATE", "WRITE", "APPEND"}:
+        return "register"
+    if token or (ticker and ticker != "NXS"):
+        return "token"
+    if ops & {"DEBIT", "CREDIT", "LEGACY"}:
+        return "payment"
+    return "other"
+
+
+def fill_tx_kinds(db, step=200000):
+    """Indexes made before the kind column: classify every stored transaction once"""
+    top = db.execute("SELECT MAX(height) FROM txs").fetchone()[0] or 0
+    for low in range(0, top + 1, step):
+        rows = db.execute("SELECT txid, type, is_reward, ops, ticker FROM txs "
+                          "WHERE height >= ? AND height < ?", (low, low + step)).fetchall()
+        db.executemany("UPDATE txs SET kind = ? WHERE txid = ?",
+                       [(tx_kind(t, r, o, k), txid) for txid, t, r, o, k in rows])
+        db.commit()
+    set_meta(db, "tx_kinds_filled", 1)
+    db.commit()
+
+
+def store_block(db, b):
+    txs = b.get("tx") or []
+    db.execute("INSERT OR REPLACE INTO blocks VALUES (?,?,?,?,?,?,?)",
+               (b["height"], b.get("hash"), b.get("timestamp"), b.get("channel"),
+                b.get("mint"), len(txs), b.get("size")))
+    for tx in txs:
+        if not isinstance(tx, dict):
+            continue
+        mv = moves_of(tx)
+        #inputs are the same NXS again as the outputs
+        amount = sum(m[5] or 0 for m in mv if m[0] != "LEGACY_IN")
+        ticker = next((m[6] for m in mv if m[6]), None)
+        ops = ",".join(sorted({m[0] for m in mv}))
+        reward = int(is_reward(tx))
+        db.execute("INSERT OR REPLACE INTO txs (txid, height, time, type, contracts, is_reward, "
+                   "amount, ticker, ops, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (tx["txid"], b["height"], tx.get("timestamp"), tx.get("type"),
+                    len(tx.get("contracts") or []), reward, amount, ticker, ops,
+                    tx_kind(tx.get("type"), reward, ops, ticker, moves_token(tx))))
+        db.executemany("INSERT OR REPLACE INTO moves VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       [(tx["txid"], i, b["height"], tx.get("timestamp"), *m) for i, m in enumerate(mv)])
+
+
+def delete_from(db, height):
+    db.execute("DELETE FROM moves WHERE height >= ?", (height,))
+    db.execute("DELETE FROM txs WHERE height >= ?", (height,))
+    db.execute("DELETE FROM blocks WHERE height >= ?", (height,))
+
+
+def get_meta(db, key, default=None):
+    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(db, key, value):
+    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
+
+
+def get_block(height):
+    """one block; if the node cannot decode a transaction, keep the others and mark that one"""
+    try:
+        return api("ledger/get/block", height=height, verbose="summary")
+    except UNREADABLE:
+        b = api("ledger/get/block", height=height)
+    txs = []
+    for t in b.get("tx") or []:
+        txid = t if isinstance(t, str) else t.get("txid")
+        try:
+            txs.append(api("ledger/get/transaction", txid=txid, verbose="summary"))
+        except UNREADABLE:
+            tip_height()  #raises if the node itself is down, so we retry later instead
+            log.warning("block %s: node cannot read tx %s", height, txid)
+            txs.append({"txid": txid, "timestamp": b.get("timestamp"), "type": "unreadable"})
+    b["tx"] = txs
+    return b
+
+
+def list_blocks(page):
+    """a page of blocks; falls back to block by block when one block in it fails"""
+    try:
+        return api("ledger/list/blocks", verbose="summary", limit=PAGE, page=page)
+    except UNREADABLE:
+        top = tip_height() - page * PAGE
+        return [get_block(h) for h in range(top, max(0, top - PAGE), -1)]
+
+
+def tip_height():
+    return api("system/get/info")["blocks"]
+
+
+def follow_tip(db):
+    """Index blocks above the highest stored one, newest page first"""
+    tip = tip_height()
+    top = db.execute("SELECT MAX(height), (SELECT hash FROM blocks ORDER BY height DESC LIMIT 1) FROM blocks").fetchone()
+    high, high_hash = top
+    if high is None:
+        blocks = list_blocks(0)
+        for b in blocks:
+            store_block(db, b)
+        set_meta(db, "backfill_low", min(b["height"] for b in blocks))
+        db.commit()
+        return
+    #reorg: our top block is no longer on the main chain
+    node_hash = api("ledger/get/block", height=high, verbose="summary").get("hash")
+    if node_hash != high_hash:
+        log.warning("reorg at %s, dropping last %s blocks", high, REORG_DEPTH)
+        delete_from(db, high - REORG_DEPTH)
+        db.commit()
+        return
+    page = 0
+    while high < tip:
+        blocks = list_blocks(page)
+        new = [b for b in blocks if b["height"] > high]
+        for b in new:
+            store_block(db, b)
+        if len(new) < len(blocks) or not blocks:
+            break
+        page += 1
+    db.commit()
+
+
+def backfill(db, budget_seconds=20):
+    """Walk down from backfill_low toward genesis for a while"""
+    return walk_down(db, "backfill_low", budget_seconds)
+
+
+#legacy transactions with inputs; legacy base (coinbase) has none
+LEGACY_INPUT_TYPES = ("legacy user", "legacy trust", "legacy genesis")
+#below this nearly every block has one, above they are scattered
+LEGACY_DENSE_BELOW = 3200000
+
+
+#first block of Tritium on mainnet: from here a legacy input can spend what an account sent
+TRITIUM_FROM = 2944207
+
+
+def inputs_short(db, height):
+    """true when a legacy payment of the block has fewer stored inputs than outputs (inputs
+    cover the outputs plus the fee), or a legacy stake has none (its outputs add the reward),
+    so the block must be read again"""
+    marks = ",".join("?" * len(LEGACY_INPUT_TYPES))
+    for txid, tx_type in db.execute(f"SELECT txid, type FROM txs WHERE height = ? AND type IN ({marks})",
+                                    (height, *LEGACY_INPUT_TYPES)).fetchall():
+        sums = dict(db.execute("SELECT op, SUM(amount) FROM moves WHERE txid = ? "
+                               "AND op IN ('LEGACY', 'LEGACY_IN') GROUP BY op", (txid,)).fetchall())
+        got = sums.get("LEGACY_IN")
+        if got is None or (tx_type == "legacy user" and got < (sums.get("LEGACY") or 0) - 1e-6):
+            return True
+    return False
+
+
+def repair_tritium_funded_inputs(db, budget_seconds=20):
+    """Legacy payments between Tritium and LEGACY_DENSE_BELOW were stored by the page by page
+    repair before moves_of() read inputs a Tritium account funded: read those blocks again"""
+    if get_meta(db, "legacy_inputs_from_start"):
+        return False
+    low = int(get_meta(db, "tritium_inputs_low", str(LEGACY_DENSE_BELOW)) or 0)
+    if low <= TRITIUM_FROM:
+        return False
+    start = time.time()
+    while low > TRITIUM_FROM and time.time() - start < budget_seconds:
+        found = [r[0] for r in db.execute(
+            "SELECT DISTINCT height FROM txs WHERE height < ? AND height >= ? AND type = 'legacy user' "
+            "ORDER BY height DESC LIMIT 50", (low, TRITIUM_FROM))]
+        for h in found:
+            if inputs_short(db, h):
+                store_block(db, get_block(h))
+        low = found[-1] if found else TRITIUM_FROM
+        set_meta(db, "tritium_inputs_low", low)
+        db.commit()
+    return True
+
+
+def repair_legacy_inputs(db, budget_seconds=20):
+    """Indexes made before LEGACY_IN have no legacy inputs: store those blocks again
+    (store_block replaces rows). Scattered blocks above LEGACY_DENSE_BELOW one by one,
+    then the legacy era page by page like the backfill"""
+    if get_meta(db, "legacy_inputs_from_start"):
+        return False
+    start = time.time()
+    low = int(get_meta(db, "legacy_sparse_low", "0") or 0)
+    if low == 0:
+        low = (db.execute("SELECT MAX(height) FROM blocks").fetchone()[0] or 0) + 1
+    marks = ",".join("?" * len(LEGACY_INPUT_TYPES))
+    while low > LEGACY_DENSE_BELOW and time.time() - start < budget_seconds:
+        found = [r[0] for r in db.execute(
+            f"SELECT DISTINCT height FROM txs WHERE height < ? AND height >= ? AND type IN ({marks}) "
+            "ORDER BY height DESC LIMIT 20", (low, LEGACY_DENSE_BELOW, *LEGACY_INPUT_TYPES))]
+        for h in found:
+            if inputs_short(db, h):
+                store_block(db, get_block(h))
+        low = found[-1] if found else LEGACY_DENSE_BELOW
+        set_meta(db, "legacy_sparse_low", low)
+        db.commit()
+    if low > LEGACY_DENSE_BELOW:
+        return True
+    if get_meta(db, "legacy_inputs_low") is None:
+        set_meta(db, "legacy_inputs_low", LEGACY_DENSE_BELOW)
+        db.commit()
+    return walk_down(db, "legacy_inputs_low", budget_seconds)
+
+
+def walk_down(db, key, budget_seconds):
+    """Store blocks below the height kept in meta `key` toward genesis for a while"""
+    low = int(get_meta(db, key, "0") or 0)
+    if low <= 1:
+        return False
+    start = time.time()
+    while low > 1 and time.time() - start < budget_seconds:
+        tip = tip_height()
+        page = max(0, (tip - (low - 1)) // PAGE)
+        blocks = list_blocks(page)
+        if not blocks:
+            break
+        for b in blocks:
+            store_block(db, b)
+        new_low = min(b["height"] for b in blocks)
+        #tip moved while paging: fill the hole block by block
+        if new_low >= low:
+            for h in range(low - 1, max(0, low - 1 - PAGE), -1):
+                store_block(db, get_block(h))
+            new_low = max(1, low - PAGE)
+        low = new_low
+        set_meta(db, key, low)
+        db.commit()
+    return True
+
+
+NXS_UNITS = 1e6
+MARKET_LIMIT = 500
+
+
+def market_side(c):
+    #market/list gives NXS amounts in base units and token amounts in whole units
+    amount = c.get("amount") or 0
+    if str(c.get("token")) == "0":
+        amount = amount / NXS_UNITS
+    return {"amount": amount, "ticker": c.get("ticker"), "token": c.get("token"),
+            "account": c.get("from") or c.get("to")}
+
+
+def market_order(o):
+    return {"txid": o.get("txid"), "timestamp": o.get("timestamp"), "owner": o.get("owner"),
+            "type": o.get("type"), "give": market_side(o.get("contract") or {}),
+            "want": market_side(o.get("order") or {})}
+
+
+def markets():
+    """Open orders and filled orders of every NXS/<ticker> pair that has any"""
+    tokens = api("register/list/finance:tokens", limit=1000)
+    out = []
+    for ticker in sorted({t["ticker"] for t in tokens if t.get("ticker")}):
+        pair = f"NXS/{ticker}"
+        try:
+            book = api("market/list/order", market=pair, limit=MARKET_LIMIT)
+            done = api("market/list/executed", market=pair, limit=MARKET_LIMIT)
+        except Exception as e:
+            log.debug("market %s: %s", pair, e)
+            continue
+        orders = [market_order(o) for k in ("asks", "bids") for o in book.get(k) or []]
+        executed = [market_order(o) for k in ("asks", "bids") for o in done.get(k) or []]
+        if orders or executed:
+            out.append({"market": pair, "orders": orders, "executed": executed})
+    return out
+
+
+ASSET_LISTS = ("assets:asset", "assets:raw", "assets:readonly", "supply:items")
+ASSET_TYPES = ("OBJECT", "RAW", "READONLY")
+LIST_LIMIT = 1000
+MAX_LIST_PAGES = 1000
+
+
+def list_all(path):
+    out = []
+    for page in range(MAX_LIST_PAGES):
+        rows = api(path, limit=LIST_LIMIT, page=page) or []
+        out += rows
+        if len(rows) < LIST_LIMIT:
+            break
+    return out
+
+
+def asset_row(a):
+    #RAW/READONLY assets keep their content in "json", objects in their own fields
+    content = a.get("json") if isinstance(a.get("json"), dict) else {}
+    fmt = a.get("type")
+    #an object can have its own field called "type", which then hides the register type
+    own_type = None
+    if fmt not in ASSET_TYPES:
+        own_type, fmt = fmt, "OBJECT"
+    #supply items are objects too, told apart only by their form
+    if a.get("form") == "SUPPLY":
+        fmt = "SUPPLY"
+    kind = a.get("distordia-type") or content.get("type") or own_type
+    if not kind and a.get("bounty_id"):
+        kind = "bounty"
+    label = (a.get("title") or content.get("title") or content.get("name") or a.get("question")
+             or a.get("name"))
+    return {"address": a.get("address"), "name": a.get("name"),
+            "label": label if isinstance(label, str) else None,
+            "kind": kind if isinstance(kind, str) else None, "type": fmt,
+            "owner": a.get("owner"), "created": a.get("created"), "modified": a.get("modified")}
+
+
+def assets():
+    """Every asset and supply item register, newest change first, without its content"""
+    rows = [asset_row(a) for path in ASSET_LISTS for a in list_all(f"register/list/{path}")]
+    return sorted(rows, key=lambda r: r.get("modified") or 0, reverse=True)
+
+
+OWNERS_SECONDS = 3600
+HOLDERS_TOP = 100
+
+
+def token_holders(accounts_all):
+    """Per token: holder count and the largest accounts"""
+    by_token = {}
+    for a in accounts_all:
+        token = str(a.get("token"))
+        if token != "0" and (a.get("balance") or 0) > 0:
+            by_token.setdefault(token, []).append(
+                {"address": a.get("address"), "owner": a.get("owner"),
+                 "balance": a.get("balance"), "modified": a.get("modified")})
+    out = {}
+    for token, accounts in by_token.items():
+        accounts.sort(key=lambda a: a["balance"], reverse=True)
+        out[token] = {"accounts": len(accounts),
+                      "owners": len({a["owner"] for a in accounts}),
+                      "top": accounts[:HOLDERS_TOP]}
+    return out
+
+
+#key hash slots of a crypto register, TAO/Register/create.cpp
+CRYPTO_KEYS = ("auth", "lisp", "network", "sign", "verify", "cert", "app1", "app2", "app3")
+
+
+def register_row(kind, r, name=None, info=None):
+    return (r.get("address"), r.get("owner"), kind, name if name is not None else r.get("name"),
+            str(r["token"]) if r.get("token") is not None else None, r.get("ticker"),
+            r.get("balance"), info, r.get("created"), r.get("modified"))
+
+
+RICH_CHAINS = 500
+
+
+def rich_chains(rows):
+    """NXS per signature chain over all its accounts and trust accounts (balance + stake):
+    {chains: how many hold any NXS, top: the largest RICH_CHAINS}"""
+    chains = {}
+    for address, owner, kind, _n, token, _t, balance, info, *_ in rows:
+        if kind not in ("account", "trust") or token not in ("0", None):
+            continue
+        c = chains.setdefault(owner, {"owner": owner, "balance": 0.0, "stake": 0.0, "accounts": 0})
+        c["balance"] += balance or 0
+        if kind == "trust" and info:
+            c["stake"] += json.loads(info).get("stake") or 0
+        c["accounts"] += 1
+    held = []
+    for c in chains.values():
+        c["total"] = round(c["balance"] + c["stake"], 6)
+        c["balance"], c["stake"] = round(c["balance"], 6), round(c["stake"], 6)
+        if c["total"] > 0:
+            held.append(c)
+    held.sort(key=lambda c: c["total"], reverse=True)
+    return {"chains": len(held), "top": held[:RICH_CHAINS]}
+
+
+def scan_owners(db):
+    """Fills the registers table (who owns what) and returns the token holders; about a minute"""
+    accounts_all = list_all("register/list/finance:accounts")
+    rows = [register_row("account", a) for a in accounts_all]
+    rows += [register_row("trust", t, info=json.dumps({"stake": t.get("stake"), "trust": t.get("trust")}))
+             for t in list_all("register/list/finance:trust")]
+    rows += [register_row("token", t, name=t.get("ticker"),
+                          info=json.dumps({"currentsupply": t.get("currentsupply"), "maxsupply": t.get("maxsupply")}))
+             for t in list_all("register/list/finance:tokens")]
+    for a in (asset_row(a) for path in ASSET_LISTS for a in list_all(f"register/list/{path}")):
+        rows.append((a["address"], a["owner"], "asset", a["label"] or a["name"], None, None, None,
+                     json.dumps({"format": a["type"], "kind": a["kind"]}), a["created"], a["modified"]))
+    for n in list_all("register/list/names:names") + list_all("register/list/names:global"):
+        rows.append(register_row("name", n, info=json.dumps({"register": n.get("register"),
+                                                             "global": bool(n.get("global"))})))
+    rows += [register_row("namespace", n, name=n.get("namespace"))
+             for n in list_all("register/list/names:namespaces")]
+    #one per signature chain, info = the key hashes that are set
+    rows += [register_row("crypto", c, name="crypto", info=json.dumps(
+        {k: c[k] for k in CRYPTO_KEYS if str(c.get(k) or "").strip("0")}))
+             for c in list_all("register/list/crypto")]
+    rows = [(*r, register_id(r[0])) for r in rows]
+    with db:
+        db.execute("DELETE FROM registers")
+        db.executemany("INSERT OR REPLACE INTO registers (address, owner, kind, name, token, ticker, "
+                       "balance, info, created, modified, id) VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)",
+                   ("richchains", int(time.time()), json.dumps(rich_chains(rows))))
+    log.info("owner index: %s registers", len(rows))
+    return token_holders(accounts_all)
+
+
+def cache_age(db, key):
+    row = db.execute("SELECT updated FROM cache WHERE key=?", (key,)).fetchone()
+    return time.time() - row[0] if row else None
+
+
+DAY = 86400
+
+
+def update_daily(db):
+    """Per UTC day: blocks and minted NXS per channel, transactions, transfers. The first run
+    reads the whole chain (minutes); later runs redo only the last two stored days."""
+    if get_meta(db, "backfill_low") not in ("0", "1"):
+        return None  #days before the backfilled part would be counted short
+    last = db.execute("SELECT MAX(day) FROM daily").fetchone()[0]
+    start = 0
+    if last is not None:
+        row = db.execute("SELECT first_height FROM daily WHERE day = ?", (last - 1,)).fetchone()
+        start = row[0] if row else 0
+    days = {}
+    for day, channel, n, mint, height in db.execute(
+            "SELECT time / ?, channel, COUNT(*), SUM(mint), MIN(height) FROM blocks "
+            "WHERE height >= ? GROUP BY time / ?, channel", (DAY, start, DAY)):
+        d = days.setdefault(day, {"first": height, "blocks": [0, 0, 0], "mint": [0.0, 0.0, 0.0],
+                                  "txs": 0, "transfers": 0})
+        d["first"] = min(d["first"], height)
+        if channel in (0, 1, 2):
+            d["blocks"][channel] = n
+            d["mint"][channel] = mint or 0.0
+    for day, n, transfers in db.execute(
+            "SELECT time / ?, COUNT(*), SUM(is_reward = 0 AND type != 'unreadable') FROM txs "
+            "WHERE height >= ? GROUP BY time / ?", (DAY, start, DAY)):
+        if day in days:
+            days[day]["txs"], days[day]["transfers"] = n, transfers or 0
+    with db:
+        db.executemany("INSERT OR REPLACE INTO daily VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       [(day, d["first"], *d["blocks"], *(round(m, 6) for m in d["mint"]),
+                         d["txs"], d["transfers"]) for day, d in days.items()])
+    #[day, stake, prime, hash blocks, stake, prime, hash mint, txs, transfers]
+    return [list(r) for r in db.execute(
+        "SELECT day, blocks_stake, blocks_prime, blocks_hash, mint_stake, mint_prime, mint_hash, "
+        "txs, transfers FROM daily ORDER BY day")]
+
+
+LEGACY_RICH = 500
+LEGACY_RICH_SECONDS = 86400
+legacy_rich_thread = None
+
+
+def legacy_rich():
+    """Balance of every legacy address (outputs to it minus inputs it spent): {total,
+    addresses with NXS, negative = addresses below zero (index gap), top}. One full pass
+    over moves, minutes, so it runs on its own read only connection"""
+    con = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True, timeout=30)
+    bal = {}
+    #one sequential read summed here: GROUP BY in SQL sorted the whole table into temp files
+    for op, frm, to, amount in con.execute(
+            "SELECT op, from_addr, to_addr, amount FROM moves WHERE op IN ('LEGACY', 'LEGACY_IN')"):
+        if op == "LEGACY":
+            #outputs to a Tritium account (8...) are claimed into it, not kept at an address
+            if to and not to.startswith("8"):
+                bal[to] = bal.get(to, 0.0) + (amount or 0)
+        elif frm:
+            bal[frm] = bal.get(frm, 0.0) - (amount or 0)
+    con.close()
+    held = sorted(((a, round(b, 6)) for a, b in bal.items() if b > 1e-6),
+                  key=lambda x: x[1], reverse=True)
+    return {"total": round(sum(b for _a, b in held), 6), "addresses": len(held),
+            "negative": sum(1 for b in bal.values() if b < -1e-6),
+            "top": [{"address": a, "balance": b} for a, b in held[:LEGACY_RICH]]}
+
+
+def start_legacy_rich(db):
+    """Daily, once the legacy inputs are complete, in a thread so the tip is followed"""
+    global legacy_rich_thread
+    if legacy_inputs_low(db) > 1:
+        return
+    if legacy_rich_thread and legacy_rich_thread.is_alive():
+        return
+    age = cache_age(db, "legacyrich")
+    if age is not None and age < LEGACY_RICH_SECONDS:
+        return
+
+    def run():
+        try:
+            data = legacy_rich()
+            con = sqlite3.connect(INDEX_DB, timeout=60)
+            with con:
+                con.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)",
+                            ("legacyrich", int(time.time()), json.dumps(data)))
+            con.close()
+            log.info("legacy rich list: %s addresses, %s NXS", data["addresses"], data["total"])
+        except Exception as e:
+            log.warning("legacy rich list failed: %s", e)
+
+    legacy_rich_thread = threading.Thread(target=run, daemon=True)
+    legacy_rich_thread.start()
+
+
+#days, 0 = all time
+LARGEST_PERIODS = (7, 30, 365, 0)
+LARGEST_ROWS = 50
+#txs.amount counts legacy change too, so more rows than shown are re-ranked by moved()
+LARGEST_CANDIDATES = 300
+
+
+def moved(moves):
+    """NXS a payment moves: its DEBITs, or legacy outputs minus change (outputs to an input address)"""
+    if any(m["op"] == "LEGACY" for m in moves):
+        spenders = {m["from_addr"] for m in moves if m["op"] == "LEGACY_IN"}
+        return sum(m["amount"] or 0 for m in moves
+                   if m["op"] == "LEGACY" and m["to_addr"] not in spenders)
+    return sum(m["amount"] or 0 for m in moves if m["op"] == "DEBIT")
+
+
+def rows_as_dicts(cursor):
+    cols = [c[0] for c in cursor.description]
+    return [dict(zip(cols, r)) for r in cursor]
+
+
+def largest_payments(db):
+    """Largest NXS payments per period, one pass over the payment rows: {"<days>": [tx with moves
+    and moved]}; token payments have their own kind and are not counted"""
+    now = int(time.time())
+    cutoffs = {d: now - d * DAY if d else 0 for d in LARGEST_PERIODS}
+    tops = {d: [] for d in LARGEST_PERIODS}
+    #reads only the covering index txs_amount, not the scattered table rows
+    for rowid, t, amount in db.execute(
+            "SELECT rowid, time, amount FROM txs INDEXED BY txs_amount "
+            "WHERE kind IN ('payment', 'legacy') AND (ops LIKE '%DEBIT%' OR ops LIKE '%LEGACY%')"):
+        item = (amount or 0, rowid)
+        for d, cut in cutoffs.items():
+            if (t or 0) >= cut:
+                if len(tops[d]) < LARGEST_CANDIDATES:
+                    heapq.heappush(tops[d], item)
+                elif item > tops[d][0]:
+                    heapq.heapreplace(tops[d], item)
+    rowids = list({rowid for heap in tops.values() for _a, rowid in heap})
+    txs, by_txid = {}, {}
+    if rowids:
+        for r in rows_as_dicts(db.execute(
+                f"SELECT rowid AS rid, * FROM txs WHERE rowid IN ({','.join('?' * len(rowids))})", rowids)):
+            rid = r.pop("rid")
+            txs[rid] = by_txid[r["txid"]] = {**r, "moves": []}
+        ids = list(by_txid)
+        for m in rows_as_dicts(db.execute(
+                f"SELECT * FROM moves WHERE txid IN ({','.join('?' * len(ids))}) ORDER BY idx", ids)):
+            by_txid[m["txid"]]["moves"].append(m)
+    for tx in txs.values():
+        tx["moved"] = round(moved(tx["moves"]), 6)
+    out = {}
+    for d, heap in tops.items():
+        rows = sorted((txs[i] for _a, i in heap if txs[i]["moved"] > 0),
+                      key=lambda r: r["moved"], reverse=True)
+        out[str(d)] = rows[:LARGEST_ROWS]
+    return out
+
+
+def refresh_caches(db):
+    jobs = {
+        "richlist": lambda: api("register/list/finance:accounts,finance:trust",
+                                sort="total", order="desc", limit=500, page=0,
+                                where="results.token=0"),
+        "trustlist": lambda: api("register/list/finance:trust", sort="trust", order="desc", limit=2000),
+        "globalnames": lambda: api("register/list/names:global", limit=5000),
+        "namespaces": lambda: api("register/list/names:namespaces", limit=5000),
+        "tokens": lambda: api("register/list/finance:tokens", sort="maxsupply", limit=1000),
+        #takes the node over 30 s, too slow to ask per page view
+        "ledgermetrics": lambda: api("ledger/get/metrics"),
+        "markets": markets,
+        "assets": assets,
+        "daily": lambda: update_daily(db),
+        #under a second on mainnet with txs_amount
+        "largest": lambda: largest_payments(db),
+    }
+    #the full register scan only once an hour; token holders come out of it
+    age = cache_age(db, "tokenholders")
+    if age is None or age >= OWNERS_SECONDS:
+        jobs["tokenholders"] = lambda: scan_owners(db)
+    start_legacy_rich(db)
+    for key, job in jobs.items():
+        try:
+            data = job()
+            if data is None:
+                continue
+            db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)", (key, int(time.time()), json.dumps(data)))
+            db.commit()
+        except Exception as e:
+            log.warning("cache %s failed: %s", key, e)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    db = connect()
+    last_cache = 0
+    while True:
+        try:
+            follow_tip(db)
+            if time.time() - last_cache > CACHE_SECONDS:
+                refresh_caches(db)
+                last_cache = time.time()
+            busy = backfill(db) or repair_legacy_inputs(db) or repair_tritium_funded_inputs(db)
+            log.info("indexed down to %s, legacy inputs down to %s (block by block passes at %s and %s)",
+                     get_meta(db, "backfill_low"), legacy_inputs_low(db),
+                     get_meta(db, "legacy_sparse_low"), get_meta(db, "tritium_inputs_low"))
+            if not busy:
+                time.sleep(FOLLOW_SECONDS)
+        except Exception as e:
+            #requests puts the url (with the node login) in the message
+            log.error("indexer error: %s", str(e).split(" for url:")[0])
+            time.sleep(FOLLOW_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

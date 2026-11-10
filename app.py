@@ -7,8 +7,12 @@ import requests_cache
 from dotenv import load_dotenv
 load_dotenv("local.env")
 
+from index_api import bp as index_bp
+
 app = Flask('__main__')
 cors = CORS(app)
+# optional /explorer/... routes, answer 503 until indexer.py has built its database
+app.register_blueprint(index_bp)
 method_requests_mapping = {
     'GET': requests.get,
     'HEAD': requests.head,
@@ -39,7 +43,7 @@ def proxy(path):
                                 headers=request.headers,
                                 params=request.args,
                                 data=request.data,
-                                json=request.json)
+                                json=request.get_json(silent=True))
         return _corsify_actual_response(resp)
 
 
@@ -52,8 +56,13 @@ def _build_cors_preflight_response():
 
 
 def _corsify_actual_response(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response.json()
+    # keep the node's status code so clients can tell errors (e.g. not found) from results
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"error": {"code": response.status_code, "message": response.text[:500]}}
+    # flask-cors adds Access-Control-Allow-Origin itself
+    return make_response(body, response.status_code)
 
 
 def main():
